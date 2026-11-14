@@ -10,12 +10,22 @@ st.set_page_config(page_title="Hunar Select Recruitment Intelligence Engine", la
 
 SIZE_BANDS = ["1,000 to 5,000", "5,000 to 20,000", "20,000+"]
 INDUSTRIES = ["Quick Commerce", "Retail", "Logistics", "BFSI", "Healthcare"]
-INDUSTRY_TERMS = {
-    "Quick Commerce": "quick commerce",
-    "Retail": "retail chains",
-    "Logistics": "logistics and supply chain",
-    "BFSI": "banks NBFC and insurance",
-    "Healthcare": "hospital chains and healthcare",
+INDUSTRY_SEGMENTS = {
+    "Quick Commerce": ("quick commerce and instant delivery",
+                       ["e-grocery and online supermarkets", "hyperlocal delivery",
+                        "fresh food, dairy and meat delivery", "e-commerce fulfilment and last-mile delivery"]),
+    "Retail": ("retail chains",
+               ["fashion and apparel retail", "grocery and supermarket chains",
+                "electronics, home and lifestyle retail", "pharmacy and specialty retail"]),
+    "Logistics": ("logistics and supply chain",
+                  ["express parcel and courier", "warehousing and third-party logistics",
+                   "trucking and freight", "last-mile delivery and fleet operators"]),
+    "BFSI": ("banks NBFC and insurance",
+             ["microfinance and housing finance", "life and general insurance",
+              "private and small finance banks", "broking and wealth management"]),
+    "Healthcare": ("hospital chains and healthcare",
+                   ["diagnostic labs and pathology", "pharmacy chains",
+                    "clinics and dialysis centres", "healthcare services and home care"]),
 }
 
 
@@ -133,14 +143,15 @@ def serper_search(query, num=10):
 
 # ---------------- Stage 3: company discovery ----------------
 def build_queries(industry, size):
-    term = INDUSTRY_TERMS[industry]
-    return [
-        f"top {term} companies in India",
-        f"largest {term} companies in India by number of employees",
-        f"{term} companies India {size} employees",
-        f"list of major {term} companies India frontline workforce",
-        f"biggest employers {term} India stores warehouses branches",
+    primary, alts = INDUSTRY_SEGMENTS[industry]
+    queries = [
+        f"top {primary} companies in India",
+        f"largest {primary} companies in India by number of employees",
+        f"{primary} companies India {size} employees",
     ]
+    for alt in alts[:4]:
+        queries.append(f"major {alt} companies in India number of employees")
+    return queries
 
 
 def parse_json_list(text):
@@ -170,7 +181,7 @@ def normalise_url(u):
     return u
 
 
-def process_companies(data, valid_urls, size, cap=30):
+def process_companies(data, valid_urls, size, cap=45):
     """Clean the AI output, drop duplicates, apply the size filter. Returns (kept, excluded)."""
     seen, rows = set(), []
     for item in data:
@@ -191,6 +202,8 @@ def process_companies(data, valid_urls, size, cap=30):
             band = "Unknown"
         if band == "Unknown":
             status = "Size unverified"
+        elif band != size:
+            status = "Size to be checked"
         elif not src:
             status = "Needs verification"
         else:
@@ -208,9 +221,14 @@ def process_companies(data, valid_urls, size, cap=30):
         })
     matched = [r for r in rows if r["Size band (est.)"] == size]
     unknown = [r for r in rows if r["Size band (est.)"] == "Unknown"]
-    excluded = [r for r in rows if r["Size band (est.)"] not in (size, "Unknown")]
+    pos = {b: i for i, b in enumerate(SIZE_BANDS)}
+    adjacent = [r for r in rows if r["Size band (est.)"] in pos and r["Size band (est.)"] != size
+                and abs(pos[r["Size band (est.)"]] - pos[size]) == 1]
+    excluded = [r for r in rows if r["Size band (est.)"] in pos and r["Size band (est.)"] != size
+                and abs(pos[r["Size band (est.)"]] - pos[size]) > 1]
     matched.sort(key=lambda r: 0 if r["Source"] else 1)  # sourced companies first
-    kept = (matched + unknown)[:cap]
+    # Neighbouring bands are kept because the Step 1 size is only a guess; Step 2 checks real headcount
+    kept = (matched + unknown + adjacent)[:cap]
     return kept, excluded
 
 
@@ -218,22 +236,24 @@ def discover_companies(industry, size, results):
     lines = []
     for i, r in enumerate(results, 1):
         lines.append(f"[{i}] {r['title'][:120]} | {r['snippet'][:200]} | {r['link']}")
-    evidence = "\n".join(lines)[:15000]
+    evidence = "\n".join(lines)[:18000]
+    primary, alts = INDUSTRY_SEGMENTS[industry]
+    segments = "; ".join([primary] + alts)
     prompt = f"""You are a research assistant building a prospect list for an Indian frontline hiring and recruitment-outsourcing company.
 
-TASK: List companies that operate in India in this industry: {industry}, and that have roughly {size} employees (global or India headcount).
+TASK: List companies that operate in India in this industry: {industry}. Segments in scope: {segments}. Prefer companies with roughly {size} employees (global or India headcount), but also include companies of nearby sizes when you are unsure, because headcount will be checked in a later step.
 
 EVIDENCE: numbered web search results below. Prefer companies named in them. You may add well-known companies from your own knowledge only if you are confident they belong in this industry and size band; for those, set source_url to an empty string.
 
 RULES:
-- Return up to 35 distinct companies. No duplicates.
+- Return up to 45 distinct companies. No duplicates.
 - Use the name people use in the market. If it is a brand of a larger parent, mention the parent in business_profile.
 - size_band must be exactly one of: "1,000 to 5,000", "5,000 to 20,000", "20,000+", "Unknown".
 - If a headcount appears in the results, put that figure in size_evidence and use it to choose size_band. Otherwise give your best estimate and set size_evidence to "Estimate, to be verified". Use "Unknown" if you cannot tell.
 - source_url must be copied exactly from one result link above that mentions the company, or be an empty string.
 - website: only if shown in the results or you are certain; otherwise an empty string.
 - business_profile: maximum 25 words. business_model: maximum 15 words. headquarters: city.
-- Exclude companies with no India presence, government bodies, and companies clearly outside the size range.
+- Exclude companies with no India presence and government bodies. Do not drop a company only because its size is uncertain: give your best estimate band, or Unknown.
 
 OUTPUT: a JSON array only. Each item has exactly these keys: company, business_profile, business_model, headquarters, website, size_band, size_evidence, source_url.
 
@@ -491,7 +511,7 @@ if disc:
 
     if not enr:
         st.info("Step 1 is done. Click the button below to add company details (headcount, locations, "
-                "frontline estimate). This takes about 2 to 4 minutes.")
+                "frontline estimate). This takes about 3 to 6 minutes.")
         if st.button("Step 2: Add company details", type="primary"):
             with st.status("Adding company details...", expanded=True) as status2:
                 try:
@@ -542,7 +562,7 @@ if disc:
             n_src = sum(1 for c in companies if c["Source"])
             msg = f"{len(companies)} candidates. {n_src} have a source link."
             if n_unv:
-                msg += f" {n_unv} have an unverified size."
+                msg += f" {n_unv} have an unverified size. Others may be in a neighbouring size band; Step 2 checks real headcount."
             st.caption(msg)
             cdf = pd.DataFrame(companies)
             cdf.insert(0, "#", range(1, len(cdf) + 1))
