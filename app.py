@@ -185,7 +185,7 @@ def normalise_url(u):
     return u
 
 
-def process_companies(data, valid_urls, size, cap=45):
+def process_companies(data, valid_urls, size, cap=50):
     """Clean the AI output, drop duplicates, apply the size filter. Returns (kept, excluded)."""
     seen, rows = set(), []
     for item in data:
@@ -236,21 +236,24 @@ def process_companies(data, valid_urls, size, cap=45):
     return kept, excluded
 
 
-def discover_companies(industry, size, results):
-    lines = []
-    for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {r['title'][:120]} | {r['snippet'][:200]} | {r['link']}")
-    evidence = "\n".join(lines)[:18000]
+def discovery_prompt(industry, size, evidence, already=None):
     primary, alts = INDUSTRY_SEGMENTS[industry]
     segments = "; ".join([primary] + alts)
-    prompt = f"""You are a research assistant building a prospect list for an Indian frontline hiring and recruitment-outsourcing company.
+    count = "up to 45"
+    extra = ""
+    if already:
+        count = "up to 30 additional"
+        extra = ("\nALREADY LISTED (do not repeat any of these): " + ", ".join(already[:80]) +
+                 "\nList additional companies only. Cover every segment in scope, and include mid-sized and "
+                 "regional chains, not only the best-known names.\n")
+    return f"""You are a research assistant building a prospect list for an Indian frontline hiring and recruitment-outsourcing company.
 
 TASK: List companies that operate in India in this industry: {industry}. Segments in scope: {segments}. Prefer companies with roughly {size} employees (global or India headcount), but also include companies of nearby sizes when you are unsure, because headcount will be checked in a later step.
-
+{extra}
 EVIDENCE: numbered web search results below. Prefer companies named in them. You may add well-known companies from your own knowledge only if you are confident they belong in this industry and size band; for those, set source_url to an empty string.
 
 RULES:
-- Return up to 45 distinct companies. No duplicates.
+- Return {count} distinct companies. No duplicates.
 - Use the name people use in the market. If it is a brand of a larger parent, mention the parent in business_profile.
 - size_band must be exactly one of: "1,000 to 5,000", "5,000 to 20,000", "20,000+", "Unknown".
 - If a headcount appears in the results, put that figure in size_evidence and use it to choose size_band. Otherwise give your best estimate and set size_evidence to "Estimate, to be verified". Use "Unknown" if you cannot tell.
@@ -264,10 +267,27 @@ OUTPUT: a JSON array only. Each item has exactly these keys: company, business_p
 SEARCH RESULTS:
 {evidence}
 """
-    text, model = gemini_generate(prompt, json_mode=True, timeout=100, max_models=4, prefer_lite=True)
-    data = parse_json_list(text)
+
+
+def discover_companies(industry, size, results):
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r['title'][:120]} | {r['snippet'][:200]} | {r['link']}")
+    evidence = "\n".join(lines)[:18000]
     valid_urls = {r["link"] for r in results}
+    text, model = gemini_generate(discovery_prompt(industry, size, evidence), json_mode=True,
+                                  timeout=100, max_models=4, prefer_lite=True)
+    data = parse_json_list(text)
     kept, excluded = process_companies(data, valid_urls, size)
+    if len(kept) < 40:  # second pass to widen the pool
+        try:
+            already = [c["Company"] for c in kept] + [e["Company"] for e in excluded]
+            text2, _ = gemini_generate(discovery_prompt(industry, size, evidence, already), json_mode=True,
+                                       timeout=100, max_models=4, prefer_lite=True)
+            data2 = parse_json_list(text2)
+            kept, excluded = process_companies(data + data2, valid_urls, size)
+        except Exception:
+            pass  # keep the first-pass result
     return kept, excluded, model
 
 
@@ -303,7 +323,8 @@ ROLE_HINTS = {
 
 
 LOW_QUALITY_SOURCES = ("linkedin.com", "ambitionbox", "glassdoor", "indeed.com", "naukri.com", "builtin",
-                       "zoominfo", "rocketreach", "growjo", "owler", "craft.co", "facebook.com")
+                       "zoominfo", "rocketreach", "growjo", "owler", "craft.co", "facebook.com", "revelio", "leadiq",
+                       "apollo.io", "signalhire", "datanyze", "comparably")
 
 
 def norm(s):
@@ -352,7 +373,7 @@ Return a JSON array with exactly one object per company, in the same order, with
 - employees_note: short note such as "FY24 global headcount", "India only", "gig partners counted separately". Empty if employees is null.
 - employees_source_url: a link copied exactly from that company's evidence that supports the figure, else ""
 - employees_confidence: "High" if the figure is recent and from the company, an annual report or reputable news; "Medium" if from an aggregator or dated; "Low" if vague or approximate; "" if employees is null
-- locations: array of up to 12 cities, states or regions where the evidence shows the company operates
+- locations: array of up to 12 cities, states or regions where the evidence shows stores, outlets or operations. Do not list only the head-office city unless that is the only evidence. Leave empty if the evidence names no places.
 - footprint: short text such as "300+ dark stores in 25 cities" only if stated in the evidence, else ""
 - frontline_roles: array of 3 to 6 frontline job categories typical for this business. You may use general industry knowledge here. Typical roles for this industry: {ROLE_HINTS[industry]}
 - recruitment_needs: one sentence on the likely recruitment requirement, based on the business model and evidence
@@ -524,6 +545,11 @@ SIGNAL_TYPES = {
     "S8": "Industry development",
 }
 EVIDENCE_POINTS = {"Confirmed": 10, "Observed": 6, "Inferred": 3}
+HIRING_WORDS = re.compile(
+    r"\b(hiring|hires?|hired|recruit\w*|jobs?|vacanc\w*|walk-?in|openings?|careers?|job creation|employment)\b", re.I)
+LOW_QUALITY_SIGNAL_DOMAINS = ("linkedin.com", "facebook.com", "naukri.com", "indeed.com", "glassdoor", "ambitionbox",
+                              "instahyre", "workindia", "hirist", "jobskul", "quikr", "shine.com", "timesjobs",
+                              "reddit.com", "youtube.com", "instagram.com")
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -545,6 +571,26 @@ def fetch_news(query):
                       "link": (it.findtext("link") or "").strip(),
                       "date": d, "source": (it.findtext("source") or "").strip()})
     return items
+
+
+def get_news(name):
+    """Two news searches per company: one on expansion, one on hiring. Company name is an exact phrase."""
+    queries = [
+        f'"{name}" India (expansion OR "new store" OR "new stores" OR warehouse OR "dark store" OR branches OR launch)',
+        f'"{name}" India (hiring OR recruitment OR jobs OR "walk-in" OR vacancies OR "job creation")',
+    ]
+    merged, seen, errors = [], set(), []
+    for q in queries:
+        try:
+            items = fetch_news(q)
+        except Exception as ex:
+            errors.append(str(ex))
+            continue
+        for it in items:
+            if it["link"] and it["link"] not in seen:
+                seen.add(it["link"])
+                merged.append(it)
+    return merged, errors
 
 
 def parse_date(s):
@@ -572,7 +618,8 @@ def recency_info(date_str, level, today):
 
 
 def build_signal_evidence(news, web, today):
-    lines, link_map = [], {}
+    """Number every evidence item (E1, E2...) so the AI cites an ID instead of copying long links."""
+    ev_map, lines, display = {}, [], []
     cutoff = today - timedelta(days=365)
     recent = []
     for n in news:
@@ -580,23 +627,36 @@ def build_signal_evidence(news, web, today):
         if d is None or d >= cutoff:
             recent.append(n)
     recent.sort(key=lambda n: n["date"], reverse=True)
-    for n in recent[:10]:
-        link_map[n["link"]] = {"date": n["date"], "source": n["source"]}
-        lines.append(f"NEWS | {n['date'] or 'no date'} | {n['title'][:150]} | source: {n['source']} | {n['link']}")
+    k = 0
+    for n in recent[:12]:
+        k += 1
+        eid = f"E{k}"
+        ev_map[eid] = {"kind": "NEWS", "date": n["date"], "title": n["title"], "snippet": "",
+                       "source": n["source"], "link": n["link"]}
+        line = f"{eid} | NEWS | {n['date'] or 'no date'} | {n['title'][:150]} | source: {n['source']}"
+        lines.append(line)
+        display.append(f"{line} | {n['link']}")
     for w in (web or [])[:6]:
         link = w.get("link", "")
         if not link:
             continue
-        link_map[link] = {"date": "", "source": ""}
-        lines.append(f"WEB | no date | {w.get('title', '')[:120]} | {w.get('snippet', '')[:240]} | {link}")
-    return "\n".join(lines)[:3200], link_map
+        k += 1
+        eid = f"E{k}"
+        ev_map[eid] = {"kind": "WEB", "date": "", "title": w.get("title", ""), "snippet": w.get("snippet", ""),
+                       "source": "", "link": link}
+        line = f"{eid} | WEB | no date | {w.get('title', '')[:120]} | {w.get('snippet', '')[:240]}"
+        lines.append(line)
+        display.append(f"{line} | {link}")
+    return "\n".join(lines)[:5200], ev_map, display
 
 
 def extract_signals_batch(industry, batch):
     blocks = [f"### COMPANY {i}: {b['name']}\n{b['evidence'] or 'No results found.'}" for i, b in enumerate(batch, 1)]
     prompt = f"""You are a sales-intelligence analyst for Hunar Select, an Indian recruitment business that supplies frontline and volume hiring (sourcing, screening and onboarding of large numbers of workers across cities) to enterprises. Industry: {industry}.
 
-For each company below, find hiring signals using ONLY the evidence given for that company (news headlines with dates, and web results). Ignore anything unrelated to workforce demand. If a company has no useful evidence, return no signals for it.
+For each company below, find hiring signals using ONLY the numbered evidence items given for that company (NEWS items have a date and headline; WEB items are search results). Report every item that shows store, branch, warehouse or facility openings, expansion plans, hiring, job creation, recruitment drives, leadership expansion or seasonal demand. Be generous: if an item is relevant, report it.
+
+Ignore items that are about a different organisation with a similar name (for example a recreation centre, a mall, a foreign company or a city), items about share prices or results with no expansion detail, and generic job-board pages that are not about this company.
 
 Signal types (use the code):
 S1 Large-scale job openings across locations
@@ -609,24 +669,23 @@ S7 High attrition or replacement hiring
 S8 Industry development creating workforce demand
 
 Evidence levels (choose exactly one):
-- Confirmed: the source explicitly states a hiring number, a hiring target, a named hiring drive or a clear hiring mandate.
-- Observed: the source shows actual open roles or a recruitment campaign, without a stated mandate.
-- Inferred: the source shows a business change that normally needs frontline staff (expansion, new facility, funding to scale, peak season) but does not mention hiring.
+- Confirmed: the item explicitly mentions hiring, jobs or recruitment AND gives a number, a target or a named drive (for example "creates 7,000 jobs" or "recruitment drive on 23 May").
+- Observed: the item shows actual open roles or a recruitment campaign, without a stated number or mandate.
+- Inferred: the item shows a business change that normally needs frontline staff (new stores, expansion targets, funding to scale, peak season) but does not mention hiring or jobs. Opening or planning stores is ALWAYS Inferred.
 
 Return a JSON array. Each item is one signal with exactly these keys:
 - company: exact company name given
+- evidence_id: the ID of the evidence item that supports it, for example "E3"
 - signal_type: one of S1 to S8
 - evidence_level: Confirmed, Observed or Inferred
 - summary: one sentence describing the development
-- source_url: copied exactly from the evidence line that supports it
-- published_date: the date shown on that evidence line as YYYY-MM-DD, or "" if the line says no date
 - roles: array of frontline roles involved (empty array if unknown)
 - locations: array of cities or states involved (empty array if unknown)
-- volume: a number or range ONLY if stated in the evidence or directly derivable; if derived, say how (for example "about 3,600 (300 stores x about 12 staff)"); otherwise "Unknown". Never guess.
+- volume: a number or range ONLY if stated in the evidence item or directly derivable from it; if derived, say how (for example "about 3,600 (300 stores x about 12 staff)"); otherwise "Unknown". Never guess. Totals shown on job-board pages (for example "7,000+ open roles") are search totals and must NOT be used as volume.
 - why_opportunity: one or two sentences on why this is a recruitment opportunity
 - how_hunar_can_help: one or two sentences tying Hunar Select's service to these roles and locations
 
-Return at most 5 signals per company, strongest first. Do not repeat the same development twice.
+Return at most 6 signals per company, strongest first. Do not repeat the same development twice.
 
 COMPANIES AND EVIDENCE:
 {chr(10).join(blocks)}
@@ -635,21 +694,42 @@ COMPANIES AND EVIDENCE:
     return parse_json_list(text), model
 
 
-def clean_signal(item, link_map, today):
+def check_level(level, ev):
+    """Code-side guardrail: hiring levels need hiring language in the source item."""
+    text = f"{ev['title']} {ev['snippet']}"
+    has_hiring = bool(HIRING_WORDS.search(text))
+    if level in ("Confirmed", "Observed") and not has_hiring:
+        return "Inferred"
+    if level == "Confirmed" and ev["kind"] == "WEB" and not re.search(r"\d", text):
+        return "Observed"
+    return level
+
+
+def clean_signal(item, ev_map, today, diag):
     code = str(item.get("signal_type", "")).strip().upper()
     if code not in SIGNAL_TYPES:
+        diag["rejected_bad_type"] += 1
         return None
-    src = str(item.get("source_url", "")).strip()
-    if src not in link_map:
-        return None  # no valid source link, so the signal is rejected
+    ev = ev_map.get(str(item.get("evidence_id", "")).strip().upper())
+    if ev is None:
+        diag["rejected_bad_evidence_id"] += 1
+        return None
     level = str(item.get("evidence_level", "")).strip().title()
     if level not in EVIDENCE_POINTS:
         level = "Inferred"
-    info = link_map[src]
-    date_str = info["date"] or (str(item.get("published_date", "")).strip() if parse_date(item.get("published_date", "")) else "")
+    checked = check_level(level, ev)
+    if checked != level:
+        diag["levels_downgraded"] += 1
+    level = checked
+    src = ev["link"]
+    host = urlparse(src).netloc.lower()
+    quality = "Low" if any(d in host for d in LOW_QUALITY_SIGNAL_DOMAINS) else "Normal"
+    date_str = ev["date"]
     age, weight, urgency = recency_info(date_str, level, today)
-    domain = urlparse(src).netloc.replace("www.", "")
     volume = str(item.get("volume", "")).strip() or "Unknown"
+    if quality == "Low":
+        volume = "Unknown"  # job-board and social counts are not reliable
+    points = EVIDENCE_POINTS[level] * weight * (0.5 if quality == "Low" else 1.0)
     return {
         "Signal type": f"{code} {SIGNAL_TYPES[code]}",
         "Evidence level": level,
@@ -663,8 +743,9 @@ def clean_signal(item, link_map, today):
         "Why it is an opportunity": str(item.get("why_opportunity", "")).strip(),
         "How Hunar Select can help": str(item.get("how_hunar_can_help", "")).strip(),
         "Source": src,
-        "Source name": info["source"] or domain,
-        "Points": round(EVIDENCE_POINTS[level] * weight, 1),
+        "Source name": ev["source"] or host.replace("www.", ""),
+        "Source quality": quality,
+        "Points": round(points, 1),
     }
 
 
@@ -694,33 +775,36 @@ def run_signals(enr, log):
     for i, name in enumerate(companies, 1):
         log(f"Collecting news and hiring pages: {name} ({i} of {len(companies)})")
         news, web = [], []
+        news, errs = get_news(name)
+        for e in errs:
+            warnings.append(f"News search problem for {name}: {e}")
         try:
-            news = fetch_news(f'{name} hiring OR recruitment OR expansion OR "new stores" OR warehouse OR "dark stores" OR branches')
-        except Exception as ex:
-            warnings.append(f"News search failed for {name}: {ex}")
-        try:
-            web = serper_raw(f"{name} hiring recruitment drive openings India", 8).get("organic", [])
+            web = serper_raw(f'"{name}" hiring recruitment drive openings India', 8).get("organic", [])
         except Exception as ex:
             warnings.append(f"Web search failed for {name}: {ex}")
-        text, link_map = build_signal_evidence(news, web, today)
-        items.append({"name": name, "evidence": text, "link_map": link_map})
-        evidence_log[name] = {"lines": text.splitlines()}
+        text, ev_map, display = build_signal_evidence(news, web, today)
+        items.append({"name": name, "evidence": text, "ev_map": ev_map})
+        evidence_log[name] = {"lines": display}
 
+    diag = {"ai_returned": 0, "rejected_bad_type": 0, "rejected_bad_evidence_id": 0,
+            "rejected_unknown_company": 0, "levels_downgraded": 0, "duplicates_removed": 0}
     signals, model = [], ""
-    for start in range(0, len(items), 3):
-        batch = items[start:start + 3]
+    for start in range(0, len(items), 2):
+        batch = items[start:start + 2]
         log(f"AI is reading the evidence: companies {start + 1} to {start + len(batch)}...")
         try:
             data, model = extract_signals_batch(industry, batch)
-            maps = {norm(b["name"]): b["link_map"] for b in batch}
+            maps = {norm(b["name"]): b["ev_map"] for b in batch}
             names = {norm(b["name"]): b["name"] for b in batch}
             for item in data:
                 if not isinstance(item, dict):
                     continue
+                diag["ai_returned"] += 1
                 key = norm(item.get("company", ""))
                 if key not in maps:
+                    diag["rejected_unknown_company"] += 1
                     continue
-                sig = clean_signal(item, maps[key], today)
+                sig = clean_signal(item, maps[key], today, diag)
                 if sig:
                     sig["Company"] = names[key]
                     signals.append(sig)
@@ -734,9 +818,11 @@ def run_signals(enr, log):
         if k not in seen:
             seen.add(k)
             unique.append(s)
+        else:
+            diag["duplicates_removed"] += 1
     unique.sort(key=lambda s: s["Points"], reverse=True)
     return {"run_id": enr["run_id"], "signals": unique, "summary": summarise_signals(companies, unique),
-            "evidence": evidence_log, "warnings": warnings, "model": model}
+            "evidence": evidence_log, "warnings": warnings, "model": model, "diagnostics": diag}
 
 
 # ---------------- Page ----------------
@@ -811,7 +897,13 @@ if disc:
             st.warning(w)
         df = pd.DataFrame(rows)
         df.insert(0, "#", range(1, len(df) + 1))
-        st.dataframe(df, hide_index=True, column_config=LINK_COLUMNS)
+        vdf = df[df["Size status"] == "Verified"]
+        udf = df[df["Size status"] != "Verified"]
+        st.markdown(f"**Verified: sourced headcount inside the size band ({len(vdf)})**")
+        st.dataframe(vdf, hide_index=True, column_config=LINK_COLUMNS)
+        if len(udf):
+            st.markdown(f"**Possible matches: headcount not found, so size is unverified ({len(udf)})**")
+            st.dataframe(udf, hide_index=True, column_config=LINK_COLUMNS)
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
                            file_name="prospects.csv", mime="text/csv")
         with st.expander("Companies left out after headcount check"):
@@ -857,7 +949,7 @@ if disc:
             sdf = pd.DataFrame(shown)
             first = ["Company", "Signal type", "Evidence level", "Date", "Urgency", "Summary", "Roles", "Locations",
                      "Est. volume", "Why it is an opportunity", "How Hunar Select can help", "Source", "Source name",
-                     "Age (days)", "Points"]
+                     "Age (days)", "Source quality", "Points"]
             sdf = sdf[first]
             st.dataframe(sdf, hide_index=True, column_config=LINK_COLUMNS)
             st.download_button("Download signals CSV", sdf.to_csv(index=False).encode("utf-8"),
@@ -869,6 +961,8 @@ if disc:
                 st.markdown(f"**{name}**")
                 st.text("\n".join(ev["lines"]) if ev["lines"] else "No evidence found.")
             st.caption(f"AI model used: {sig['model']}")
+        with st.expander("Diagnostics: signals the AI returned, and how many were rejected or downgraded"):
+            st.write(sig["diagnostics"])
 
     companies = disc["companies"]
     with st.expander("Step 1 results: candidate companies", expanded=not enr):
