@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 import requests
 
@@ -14,12 +15,8 @@ col3.text_input("Geography", value="India", disabled=True)
 if st.button("Run research", type="primary"):
     st.info(f"Research for {industry}, {size}, India will run here from Stage 3.")
 
-# ---------------- Stage 2: Connection test ----------------
-st.divider()
-st.subheader("Connection test")
-st.caption("Checks that every service the engine needs is reachable. Keys are never shown.")
 
-
+# ---------------- Shared helpers ----------------
 def get_secret(name):
     try:
         return st.secrets[name]
@@ -27,30 +24,68 @@ def get_secret(name):
         return None
 
 
-def test_gemini():
+SKIP_WORDS = ["preview", "exp", "image", "tts", "live", "audio", "thinking", "robotics", "computer"]
+
+
+def gemini_generate(prompt):
+    """Ask Gemini. Retries when busy and falls back to other Flash models.
+    Returns (text, model_used). Raises RuntimeError if everything fails."""
     key = get_secret("GEMINI_API_KEY")
     if not key:
-        return False, "GEMINI_API_KEY not found in Secrets."
+        raise RuntimeError("GEMINI_API_KEY not found in Secrets.")
     headers = {"x-goog-api-key": key}
+
     r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                      headers=headers, timeout=30)
     if r.status_code != 200:
-        return False, f"Could not list models: {r.status_code} {r.text[:200]}"
+        raise RuntimeError(f"Could not list models: {r.status_code} {r.text[:200]}")
     names = [m["name"] for m in r.json().get("models", [])
              if "generateContent" in m.get("supportedGenerationMethods", [])]
+
+    def usable(n):
+        return "flash" in n and not any(w in n for w in SKIP_WORDS)
+
+    order = []
     if "models/gemini-flash-latest" in names:
-        model = "models/gemini-flash-latest"
-    else:
-        flash = sorted([n for n in names if "flash" in n], reverse=True)
-        if not flash:
-            return False, "No Gemini Flash model available for this key."
-        model = flash[0]
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
-    body = {"contents": [{"parts": [{"text": "Reply with the single word OK"}]}]}
-    r2 = requests.post(url, headers=headers, json=body, timeout=60)
-    if r2.status_code != 200:
-        return False, f"Model {model} failed: {r2.status_code} {r2.text[:200]}"
-    text = r2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        order.append("models/gemini-flash-latest")
+    full = sorted([n for n in names if usable(n) and "lite" not in n], reverse=True)
+    lite = sorted([n for n in names if usable(n) and "lite" in n], reverse=True)
+    for n in full + lite:
+        if n not in order:
+            order.append(n)
+    if not order:
+        raise RuntimeError("No Gemini Flash model available for this key.")
+
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    last_error = ""
+    for model in order[:5]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
+        for attempt in range(2):
+            resp = requests.post(url, headers=headers, json=body, timeout=90)
+            if resp.status_code == 200:
+                try:
+                    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception:
+                    text = ""
+                return text.strip(), model
+            last_error = f"{model}: {resp.status_code} {resp.text[:150]}"
+            if resp.status_code in (401, 403):
+                raise RuntimeError(last_error)
+            if resp.status_code in (429, 500, 503):
+                time.sleep(2 * (attempt + 1))
+                continue
+            break  # other errors: move on to the next model
+    raise RuntimeError("All Gemini models were busy or failed. Last error: " + last_error)
+
+
+# ---------------- Connection test ----------------
+st.divider()
+st.subheader("Connection test")
+st.caption("Checks that every service the engine needs is reachable. Keys are never shown.")
+
+
+def test_gemini():
+    text, model = gemini_generate("Reply with the single word OK")
     return True, f"Working. Model used: {model}. Reply: {text}"
 
 
