@@ -28,8 +28,8 @@ SKIP_WORDS = ["preview", "exp", "image", "tts", "live", "audio", "thinking", "ro
 
 
 def gemini_generate(prompt):
-    """Ask Gemini. Retries when busy and falls back to other Flash models.
-    Returns (text, model_used). Raises RuntimeError if everything fails."""
+    """Ask Gemini. Tries several Flash models, retries when busy, and moves on after a timeout.
+    Returns (text, model_used). Raises RuntimeError listing every attempt if all fail."""
     key = get_secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY not found in Secrets.")
@@ -43,39 +43,48 @@ def gemini_generate(prompt):
              if "generateContent" in m.get("supportedGenerationMethods", [])]
 
     def usable(n):
-        return "flash" in n and not any(w in n for w in SKIP_WORDS)
+        return "flash" in n and not any(w in n for w in SKIP_WORDS) and "latest" not in n
 
-    order = []
-    if "models/gemini-flash-latest" in names:
-        order.append("models/gemini-flash-latest")
     full = sorted([n for n in names if usable(n) and "lite" not in n], reverse=True)
     lite = sorted([n for n in names if usable(n) and "lite" in n], reverse=True)
-    for n in full + lite:
-        if n not in order:
-            order.append(n)
+    order = full + lite
+    for alias in ("models/gemini-flash-latest", "models/gemini-flash-lite-latest"):
+        if alias in names and alias not in order:
+            order.append(alias)
     if not order:
         raise RuntimeError("No Gemini Flash model available for this key.")
 
+    # Start with the model that worked last time, if any
+    last_good = st.session_state.get("gemini_model")
+    if last_good in order:
+        order.remove(last_good)
+        order.insert(0, last_good)
+
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    last_error = ""
-    for model in order[:5]:
+    attempts = []
+    for model in order[:6]:
         url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
         for attempt in range(2):
-            resp = requests.post(url, headers=headers, json=body, timeout=90)
+            try:
+                resp = requests.post(url, headers=headers, json=body, timeout=40)
+            except requests.exceptions.RequestException:
+                attempts.append(f"{model}: timed out")
+                break  # move to the next model
             if resp.status_code == 200:
                 try:
                     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                 except Exception:
                     text = ""
+                st.session_state["gemini_model"] = model
                 return text.strip(), model
-            last_error = f"{model}: {resp.status_code} {resp.text[:150]}"
+            attempts.append(f"{model}: {resp.status_code}")
             if resp.status_code in (401, 403):
-                raise RuntimeError(last_error)
+                raise RuntimeError(f"Key rejected. {resp.text[:200]}")
             if resp.status_code in (429, 500, 503):
                 time.sleep(2 * (attempt + 1))
                 continue
-            break  # other errors: move on to the next model
-    raise RuntimeError("All Gemini models were busy or failed. Last error: " + last_error)
+            break  # other errors: next model
+    raise RuntimeError("All Gemini models were busy or failed. Tried: " + "; ".join(attempts))
 
 
 # ---------------- Connection test ----------------
