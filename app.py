@@ -27,42 +27,61 @@ def get_secret(name):
         return None
 
 
-SKIP_WORDS = ["preview", "exp", "image", "tts", "live", "audio", "thinking", "robotics", "computer"]
+SKIP_WORDS = ["preview", "exp", "image", "tts", "live", "audio", "thinking", "robotics", "computer", "omni"]
 
 
-def gemini_generate(prompt, json_mode=False, timeout=40, max_models=6):
-    """Ask Gemini. Tries several Flash models, retries when busy, moves on after a timeout.
-    Returns (text, model_used). Raises RuntimeError listing every attempt if all fail."""
+def list_gemini_models():
     key = get_secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY not found in Secrets.")
-    headers = {"x-goog-api-key": key}
-
     r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                     headers=headers, timeout=30)
+                     headers={"x-goog-api-key": key}, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"Could not list models: {r.status_code} {r.text[:200]}")
-    names = [m["name"] for m in r.json().get("models", [])
-             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    return [m["name"] for m in r.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])]
 
+
+def order_models(names, prefer_lite=False, pinned=None):
+    """Decide which models to try, in order."""
     def usable(n):
         return "flash" in n and not any(w in n for w in SKIP_WORDS) and "latest" not in n
 
     full = sorted([n for n in names if usable(n) and "lite" not in n], reverse=True)
     lite = sorted([n for n in names if usable(n) and "lite" in n], reverse=True)
-    order = full + lite
-    for alias in ("models/gemini-flash-latest", "models/gemini-flash-lite-latest"):
+    order = (lite + full) if prefer_lite else (full + lite)
+    aliases = ["models/gemini-flash-lite-latest", "models/gemini-flash-latest"] if prefer_lite \
+        else ["models/gemini-flash-latest", "models/gemini-flash-lite-latest"]
+    for alias in aliases:
         if alias in names and alias not in order:
             order.append(alias)
+    if pinned:
+        pinned = pinned if pinned.startswith("models/") else "models/" + pinned
+        if pinned in order:
+            order.remove(pinned)
+        order.insert(0, pinned)
+    return order
+
+
+def gemini_generate(prompt, json_mode=False, timeout=40, max_models=6, prefer_lite=False):
+    """Ask Gemini. Tries several Flash models, skips quickly on quota errors, retries when busy.
+    Returns (text, model_used). Raises RuntimeError listing every attempt if all fail."""
+    key = get_secret("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not found in Secrets.")
+    headers = {"x-goog-api-key": key}
+    names = list_gemini_models()
+    order = order_models(names, prefer_lite, get_secret("GEMINI_MODEL"))
     if not order:
         raise RuntimeError("No Gemini Flash model available for this key.")
 
-    last_good = st.session_state.get("gemini_model")
+    memory_key = "gemini_model_lite" if prefer_lite else "gemini_model_full"
+    last_good = st.session_state.get(memory_key)
     if last_good in order:
         order.remove(last_good)
         order.insert(0, last_good)
 
-    gen_config = {"temperature": 0.2, "maxOutputTokens": 8192}
+    gen_config = {"temperature": 0.2, "maxOutputTokens": 12000}
     if json_mode:
         gen_config["responseMimeType"] = "application/json"
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_config}
@@ -82,15 +101,15 @@ def gemini_generate(prompt, json_mode=False, timeout=40, max_models=6):
                 except Exception:
                     attempts.append(f"{model}: empty reply")
                     break
-                st.session_state["gemini_model"] = model
+                st.session_state[memory_key] = model
                 return text.strip(), model
             attempts.append(f"{model}: {resp.status_code}")
             if resp.status_code in (401, 403):
                 raise RuntimeError(f"Key rejected. {resp.text[:200]}")
-            if resp.status_code in (429, 500, 503):
-                time.sleep(2 * (attempt + 1))
+            if resp.status_code in (500, 503) and attempt == 0:
+                time.sleep(3)
                 continue
-            break
+            break  # 429 (quota) and other errors: go to the next model straight away
     raise RuntimeError("All Gemini models were busy or failed. Tried: " + "; ".join(attempts))
 
 
@@ -194,8 +213,8 @@ def process_companies(data, valid_urls, size, cap=25):
 def discover_companies(industry, size, results):
     lines = []
     for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {r['title']} | {r['snippet']} | {r['link']}")
-    evidence = "\n".join(lines)[:24000]
+        lines.append(f"[{i}] {r['title'][:120]} | {r['snippet'][:200]} | {r['link']}")
+    evidence = "\n".join(lines)[:15000]
     prompt = f"""You are a research assistant building a prospect list for an Indian frontline hiring and recruitment-outsourcing company.
 
 TASK: List companies that operate in India in this industry: {industry}, and that have roughly {size} employees (global or India headcount).
@@ -203,7 +222,7 @@ TASK: List companies that operate in India in this industry: {industry}, and tha
 EVIDENCE: numbered web search results below. Prefer companies named in them. You may add well-known companies from your own knowledge only if you are confident they belong in this industry and size band; for those, set source_url to an empty string.
 
 RULES:
-- Return up to 35 distinct companies. No duplicates.
+- Return up to 30 distinct companies. No duplicates.
 - Use the name people use in the market. If it is a brand of a larger parent, mention the parent in business_profile.
 - size_band must be exactly one of: "1,000 to 5,000", "5,000 to 20,000", "20,000+", "Unknown".
 - If a headcount appears in the results, put that figure in size_evidence and use it to choose size_band. Otherwise give your best estimate and set size_evidence to "Estimate, to be verified". Use "Unknown" if you cannot tell.
@@ -217,7 +236,7 @@ OUTPUT: a JSON array only. Each item has exactly these keys: company, business_p
 SEARCH RESULTS:
 {evidence}
 """
-    text, model = gemini_generate(prompt, json_mode=True, timeout=60, max_models=4)
+    text, model = gemini_generate(prompt, json_mode=True, timeout=100, max_models=4, prefer_lite=True)
     data = parse_json_list(text)
     valid_urls = {r["link"] for r in results}
     kept, excluded = process_companies(data, valid_urls, size)
@@ -331,6 +350,12 @@ with st.expander("Connection test"):
         if r.status_code != 200:
             return False, f"Failed: {r.status_code}"
         return True, f"Working. Read {len(r.text)} characters from a test page."
+
+    if st.button("Show available AI models"):
+        try:
+            st.write(list_gemini_models())
+        except Exception as e:
+            st.error(str(e))
 
     if st.button("Run connection test"):
         tests = [("Gemini (AI)", test_gemini), ("Serper (Google search)", test_serper),
