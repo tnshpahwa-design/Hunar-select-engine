@@ -1,6 +1,10 @@
 import json
 import re
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import requests
@@ -298,6 +302,10 @@ ROLE_HINTS = {
 }
 
 
+LOW_QUALITY_SOURCES = ("linkedin.com", "ambitionbox", "glassdoor", "indeed.com", "naukri.com", "builtin",
+                       "zoominfo", "rocketreach", "growjo", "owler", "craft.co", "facebook.com")
+
+
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
@@ -378,6 +386,8 @@ def clean_enrichment(item, urls):
     conf = str(item.get("employees_confidence", "")).strip().title() if n else ""
     if conf not in ("High", "Medium", "Low"):
         conf = "Low" if n else ""
+    if n and any(d in src.lower() for d in LOW_QUALITY_SOURCES):
+        conf = "Low"  # profile counts and review sites are not reliable headcounts
     return {
         "employees": n,
         "employees_note": str(item.get("employees_note", "")).strip() if n else "",
@@ -431,6 +441,26 @@ def assemble_final(candidates, enrichments, industry, size, cap=25):
     return (verified + unverified)[:cap], excluded
 
 
+def enrich_items(industry, items, log, warnings):
+    out, model = {}, ""
+    for start in range(0, len(items), 5):
+        batch = items[start:start + 5]
+        log(f"AI is reading the evidence: companies {start + 1} to {start + len(batch)}...")
+        try:
+            data, model = enrich_batch(industry, batch)
+            by_name = {norm(d.get("company", "")): d for d in data if isinstance(d, dict)}
+            for j, b in enumerate(batch):
+                d = by_name.get(norm(b["name"]))
+                if d is None and len(data) == len(batch) and isinstance(data[j], dict):
+                    d = data[j]
+                if d:
+                    out[b["name"]] = clean_enrichment(d, b["urls"])
+        except Exception as ex:
+            warnings.append(f"AI step failed for companies {start + 1} to {start + len(batch)}: {ex}")
+        time.sleep(1)
+    return out, model
+
+
 def run_enrichment(disc, log):
     industry, size = disc["industry"], disc["size"]
     cands = disc["companies"]
@@ -448,26 +478,265 @@ def run_enrichment(disc, log):
         items.append({"name": name, "evidence": evidence or "No search results.", "urls": set(urls)})
         evidence_log[name] = {"query": q, "links": urls}
 
-    enrichments, model = {}, ""
-    for start in range(0, len(items), 5):
-        batch = items[start:start + 5]
-        log(f"AI is reading the evidence: companies {start + 1} to {start + len(batch)}...")
-        try:
-            data, model = enrich_batch(industry, batch)
-            by_name = {norm(d.get("company", "")): d for d in data if isinstance(d, dict)}
-            for j, b in enumerate(batch):
-                d = by_name.get(norm(b["name"]))
-                if d is None and len(data) == len(batch) and isinstance(data[j], dict):
-                    d = data[j]
-                if d:
-                    enrichments[b["name"]] = clean_enrichment(d, b["urls"])
-        except Exception as ex:
-            warnings.append(f"AI step failed for companies {start + 1} to {start + len(batch)}: {ex}")
-        time.sleep(1)
+    enrichments, model = enrich_items(industry, items, log, warnings)
+
+    # Second look: companies with no sourced headcount get one more search with different wording
+    missing = [it for it in items if not (enrichments.get(it["name"]) or {}).get("employees")][:12]
+    if missing:
+        items2 = []
+        for i, it in enumerate(missing, 1):
+            log(f"Second look for headcount: {it['name']} ({i} of {len(missing)})")
+            q2 = f"{it['name']} company size number of employees workforce India"
+            try:
+                raw = serper_raw(q2, 8)
+            except Exception:
+                raw = {}
+            evidence, urls = build_evidence(raw)
+            items2.append({"name": it["name"], "evidence": evidence or "No search results.", "urls": set(urls)})
+            evidence_log[it["name"]]["links"] = evidence_log[it["name"]]["links"] + urls
+            evidence_log[it["name"]]["query"] += f" | {q2}"
+        second, m2 = enrich_items(industry, items2, log, warnings)
+        model = m2 or model
+        for name, e2 in second.items():
+            if e2.get("employees"):
+                merged = dict(enrichments.get(name) or e2)
+                for k in ("employees", "employees_note", "employees_source_url", "employees_confidence"):
+                    merged[k] = e2[k]
+                for k in ("locations", "footprint", "frontline_roles", "recruitment_needs"):
+                    if not merged.get(k):
+                        merged[k] = e2.get(k)
+                enrichments[name] = merged
 
     final, excluded = assemble_final(cands, enrichments, industry, size)
     return {"run_id": disc["run_id"], "industry": industry, "size": size, "rows": final,
             "excluded": excluded, "evidence": evidence_log, "warnings": warnings, "model": model}
+
+
+# ---------------- Stage 5: hiring signals ----------------
+SIGNAL_TYPES = {
+    "S1": "Large-scale job openings",
+    "S2": "New facility launch",
+    "S3": "Geographic or business expansion",
+    "S4": "Hiring drive or campaign",
+    "S5": "Leadership or organisational expansion",
+    "S6": "Seasonal workforce need",
+    "S7": "High attrition or replacement hiring",
+    "S8": "Industry development",
+}
+EVIDENCE_POINTS = {"Confirmed": 10, "Observed": 6, "Inferred": 3}
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_news(query):
+    """Google News RSS (free, no key). Returns recent items with title, link, date and source."""
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code != 200:
+        raise RuntimeError(f"Google News returned {r.status_code}")
+    root = ET.fromstring(r.content)
+    items = []
+    for it in root.iter("item"):
+        pub = (it.findtext("pubDate") or "").strip()
+        try:
+            d = parsedate_to_datetime(pub).date().isoformat()
+        except Exception:
+            d = ""
+        items.append({"title": (it.findtext("title") or "").strip(),
+                      "link": (it.findtext("link") or "").strip(),
+                      "date": d, "source": (it.findtext("source") or "").strip()})
+    return items
+
+
+def parse_date(s):
+    try:
+        return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def recency_info(date_str, level, today):
+    """Returns (age_days, recency_weight, urgency) using the rules in the Product Definition."""
+    d = parse_date(date_str)
+    if d is None:
+        return None, 0.2, "Unknown"
+    age = (today - d).days
+    if age <= 30:
+        return age, 1.0, "High"
+    if age <= 90:
+        return age, 0.7, "High" if level in ("Confirmed", "Observed") else "Medium"
+    if age <= 180:
+        return age, 0.4, "Medium"
+    if age <= 365:
+        return age, 0.2, "Low"
+    return age, 0.0, "None"
+
+
+def build_signal_evidence(news, web, today):
+    lines, link_map = [], {}
+    cutoff = today - timedelta(days=365)
+    recent = []
+    for n in news:
+        d = parse_date(n["date"])
+        if d is None or d >= cutoff:
+            recent.append(n)
+    recent.sort(key=lambda n: n["date"], reverse=True)
+    for n in recent[:10]:
+        link_map[n["link"]] = {"date": n["date"], "source": n["source"]}
+        lines.append(f"NEWS | {n['date'] or 'no date'} | {n['title'][:150]} | source: {n['source']} | {n['link']}")
+    for w in (web or [])[:6]:
+        link = w.get("link", "")
+        if not link:
+            continue
+        link_map[link] = {"date": "", "source": ""}
+        lines.append(f"WEB | no date | {w.get('title', '')[:120]} | {w.get('snippet', '')[:240]} | {link}")
+    return "\n".join(lines)[:3200], link_map
+
+
+def extract_signals_batch(industry, batch):
+    blocks = [f"### COMPANY {i}: {b['name']}\n{b['evidence'] or 'No results found.'}" for i, b in enumerate(batch, 1)]
+    prompt = f"""You are a sales-intelligence analyst for Hunar Select, an Indian recruitment business that supplies frontline and volume hiring (sourcing, screening and onboarding of large numbers of workers across cities) to enterprises. Industry: {industry}.
+
+For each company below, find hiring signals using ONLY the evidence given for that company (news headlines with dates, and web results). Ignore anything unrelated to workforce demand. If a company has no useful evidence, return no signals for it.
+
+Signal types (use the code):
+S1 Large-scale job openings across locations
+S2 New store, warehouse, dark store, branch, hospital or facility launch
+S3 Geographic or business expansion (new cities, states, verticals, formats)
+S4 Hiring drive or recruitment campaign
+S5 Leadership or organisational expansion
+S6 Seasonal workforce requirement (festive season, sale events, peaks)
+S7 High attrition or replacement hiring
+S8 Industry development creating workforce demand
+
+Evidence levels (choose exactly one):
+- Confirmed: the source explicitly states a hiring number, a hiring target, a named hiring drive or a clear hiring mandate.
+- Observed: the source shows actual open roles or a recruitment campaign, without a stated mandate.
+- Inferred: the source shows a business change that normally needs frontline staff (expansion, new facility, funding to scale, peak season) but does not mention hiring.
+
+Return a JSON array. Each item is one signal with exactly these keys:
+- company: exact company name given
+- signal_type: one of S1 to S8
+- evidence_level: Confirmed, Observed or Inferred
+- summary: one sentence describing the development
+- source_url: copied exactly from the evidence line that supports it
+- published_date: the date shown on that evidence line as YYYY-MM-DD, or "" if the line says no date
+- roles: array of frontline roles involved (empty array if unknown)
+- locations: array of cities or states involved (empty array if unknown)
+- volume: a number or range ONLY if stated in the evidence or directly derivable; if derived, say how (for example "about 3,600 (300 stores x about 12 staff)"); otherwise "Unknown". Never guess.
+- why_opportunity: one or two sentences on why this is a recruitment opportunity
+- how_hunar_can_help: one or two sentences tying Hunar Select's service to these roles and locations
+
+Return at most 5 signals per company, strongest first. Do not repeat the same development twice.
+
+COMPANIES AND EVIDENCE:
+{chr(10).join(blocks)}
+"""
+    text, model = gemini_generate(prompt, json_mode=True, timeout=100, max_models=4, prefer_lite=True)
+    return parse_json_list(text), model
+
+
+def clean_signal(item, link_map, today):
+    code = str(item.get("signal_type", "")).strip().upper()
+    if code not in SIGNAL_TYPES:
+        return None
+    src = str(item.get("source_url", "")).strip()
+    if src not in link_map:
+        return None  # no valid source link, so the signal is rejected
+    level = str(item.get("evidence_level", "")).strip().title()
+    if level not in EVIDENCE_POINTS:
+        level = "Inferred"
+    info = link_map[src]
+    date_str = info["date"] or (str(item.get("published_date", "")).strip() if parse_date(item.get("published_date", "")) else "")
+    age, weight, urgency = recency_info(date_str, level, today)
+    domain = urlparse(src).netloc.replace("www.", "")
+    volume = str(item.get("volume", "")).strip() or "Unknown"
+    return {
+        "Signal type": f"{code} {SIGNAL_TYPES[code]}",
+        "Evidence level": level,
+        "Date": date_str or "Date unverified",
+        "Age (days)": age,
+        "Urgency": urgency,
+        "Summary": str(item.get("summary", "")).strip(),
+        "Roles": ", ".join(as_list(item.get("roles"), 8)),
+        "Locations": ", ".join(as_list(item.get("locations"), 10)),
+        "Est. volume": volume,
+        "Why it is an opportunity": str(item.get("why_opportunity", "")).strip(),
+        "How Hunar Select can help": str(item.get("how_hunar_can_help", "")).strip(),
+        "Source": src,
+        "Source name": info["source"] or domain,
+        "Points": round(EVIDENCE_POINTS[level] * weight, 1),
+    }
+
+
+def summarise_signals(companies, signals):
+    rows = []
+    for name in companies:
+        mine = [s for s in signals if s["Company"] == name]
+        counts = {lvl: sum(1 for s in mine if s["Evidence level"] == lvl) for lvl in EVIDENCE_POINTS}
+        dated = [s["Date"] for s in mine if parse_date(s["Date"])]
+        top = max(mine, key=lambda s: s["Points"]) if mine else None
+        rows.append({
+            "Company": name,
+            "Confirmed": counts["Confirmed"], "Observed": counts["Observed"], "Inferred": counts["Inferred"],
+            "Signal points": round(sum(s["Points"] for s in mine), 1),
+            "Latest signal": max(dated) if dated else "",
+            "Top signal": top["Summary"] if top else "No signals found",
+        })
+    rows.sort(key=lambda r: r["Signal points"], reverse=True)
+    return rows
+
+
+def run_signals(enr, log):
+    industry = enr["industry"]
+    companies = [r["Company"] for r in enr["rows"]]
+    today = datetime.now(timezone.utc).date()
+    items, evidence_log, warnings = [], {}, []
+    for i, name in enumerate(companies, 1):
+        log(f"Collecting news and hiring pages: {name} ({i} of {len(companies)})")
+        news, web = [], []
+        try:
+            news = fetch_news(f'{name} hiring OR recruitment OR expansion OR "new stores" OR warehouse OR "dark stores" OR branches')
+        except Exception as ex:
+            warnings.append(f"News search failed for {name}: {ex}")
+        try:
+            web = serper_raw(f"{name} hiring recruitment drive openings India", 8).get("organic", [])
+        except Exception as ex:
+            warnings.append(f"Web search failed for {name}: {ex}")
+        text, link_map = build_signal_evidence(news, web, today)
+        items.append({"name": name, "evidence": text, "link_map": link_map})
+        evidence_log[name] = {"lines": text.splitlines()}
+
+    signals, model = [], ""
+    for start in range(0, len(items), 3):
+        batch = items[start:start + 3]
+        log(f"AI is reading the evidence: companies {start + 1} to {start + len(batch)}...")
+        try:
+            data, model = extract_signals_batch(industry, batch)
+            maps = {norm(b["name"]): b["link_map"] for b in batch}
+            names = {norm(b["name"]): b["name"] for b in batch}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                key = norm(item.get("company", ""))
+                if key not in maps:
+                    continue
+                sig = clean_signal(item, maps[key], today)
+                if sig:
+                    sig["Company"] = names[key]
+                    signals.append(sig)
+        except Exception as ex:
+            warnings.append(f"AI step failed for companies {start + 1} to {start + len(batch)}: {ex}")
+        time.sleep(1)
+
+    seen, unique = set(), []
+    for s in signals:  # drop duplicate developments
+        k = (s["Company"], s["Source"], norm(s["Summary"])[:60])
+        if k not in seen:
+            seen.add(k)
+            unique.append(s)
+    unique.sort(key=lambda s: s["Points"], reverse=True)
+    return {"run_id": enr["run_id"], "signals": unique, "summary": summarise_signals(companies, unique),
+            "evidence": evidence_log, "warnings": warnings, "model": model}
 
 
 # ---------------- Page ----------------
@@ -490,6 +759,7 @@ col3.text_input("Geography", value="India", disabled=True)
 
 if st.button("Run research", type="primary"):
     st.session_state.pop("enriched", None)
+    st.session_state.pop("signals", None)
     with st.status("Researching...", expanded=True) as status:
         try:
             out = run_discovery(industry, size, st.write)
@@ -503,6 +773,9 @@ disc = st.session_state.get("discovery")
 enr = st.session_state.get("enriched")
 if enr and disc and enr["run_id"] != disc["run_id"]:
     enr = None
+sig = st.session_state.get("signals")
+if sig and (not enr or sig["run_id"] != enr["run_id"]):
+    sig = None
 
 if disc:
     if (disc["industry"], disc["size"]) != (industry, size):
@@ -533,7 +806,7 @@ if disc:
             msg += f" {n_unv} have no sourced headcount yet (size unverified)."
         if len(rows) < 25:
             msg += " Fewer than 25 qualified, so this is everything found."
-        st.caption(msg + " Blank means Not found. Frontline numbers are estimates.")
+        st.caption(msg + " None means Not found. Frontline numbers are estimates.")
         for w in enr["warnings"]:
             st.warning(w)
         df = pd.DataFrame(rows)
@@ -552,6 +825,50 @@ if disc:
                   for k, v in enr["evidence"].items()]
             st.dataframe(pd.DataFrame(ev), hide_index=True)
             st.caption(f"AI model used: {enr['model']}")
+
+    if enr and not sig:
+        st.info("Step 2 is done. Click below to find hiring signals (news, hiring activity, expansion) for "
+                "the companies above. This takes about 3 to 5 minutes.")
+        if st.button("Step 3: Find hiring signals", type="primary"):
+            with st.status("Finding hiring signals...", expanded=True) as status3:
+                try:
+                    sig = run_signals(enr, st.write)
+                    st.session_state["signals"] = sig
+                    status3.update(label="Signals found.", state="complete")
+                    st.rerun()
+                except Exception as e:
+                    status3.update(label="Finding signals failed", state="error")
+                    st.error(str(e))
+
+    if sig:
+        st.subheader("Hiring signals")
+        n_c = len({s["Company"] for s in sig["signals"]})
+        st.caption(f"{len(sig['signals'])} signals found across {n_c} companies. "
+                   "Confirmed = explicit hiring mandate. Observed = visible hiring activity. "
+                   "Inferred = a business change that implies hiring. Every signal has a source link.")
+        for w in sig["warnings"]:
+            st.warning(w)
+        st.markdown("**Companies ranked by signal strength**")
+        st.dataframe(pd.DataFrame(sig["summary"]), hide_index=True)
+        levels = st.multiselect("Show evidence levels", list(EVIDENCE_POINTS), default=list(EVIDENCE_POINTS),
+                                key="level_filter")
+        shown = [x for x in sig["signals"] if x["Evidence level"] in levels]
+        if shown:
+            sdf = pd.DataFrame(shown)
+            first = ["Company", "Signal type", "Evidence level", "Date", "Urgency", "Summary", "Roles", "Locations",
+                     "Est. volume", "Why it is an opportunity", "How Hunar Select can help", "Source", "Source name",
+                     "Age (days)", "Points"]
+            sdf = sdf[first]
+            st.dataframe(sdf, hide_index=True, column_config=LINK_COLUMNS)
+            st.download_button("Download signals CSV", sdf.to_csv(index=False).encode("utf-8"),
+                               file_name="signals.csv", mime="text/csv")
+        else:
+            st.write("No signals match the filter.")
+        with st.expander("Evidence collected for signals (news headlines and web results)"):
+            for name, ev in sig["evidence"].items():
+                st.markdown(f"**{name}**")
+                st.text("\n".join(ev["lines"]) if ev["lines"] else "No evidence found.")
+            st.caption(f"AI model used: {sig['model']}")
 
     companies = disc["companies"]
     with st.expander("Step 1 results: candidate companies", expanded=not enr):
