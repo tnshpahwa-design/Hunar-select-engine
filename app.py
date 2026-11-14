@@ -114,7 +114,7 @@ def gemini_generate(prompt, json_mode=False, timeout=40, max_models=6, prefer_li
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def serper_search(query, num=10):
+def serper_raw(query, num=10):
     """Google search through Serper (India results). Cached for 24 hours to save free credits."""
     key = get_secret("SERPER_API_KEY")
     if not key:
@@ -124,7 +124,11 @@ def serper_search(query, num=10):
                       json={"q": query, "gl": "in", "num": num}, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"Serper failed: {r.status_code} {r.text[:200]}")
-    return r.json().get("organic", [])
+    return r.json()
+
+
+def serper_search(query, num=10):
+    return serper_raw(query, num).get("organic", [])
 
 
 # ---------------- Stage 3: company discovery ----------------
@@ -166,7 +170,7 @@ def normalise_url(u):
     return u
 
 
-def process_companies(data, valid_urls, size, cap=25):
+def process_companies(data, valid_urls, size, cap=30):
     """Clean the AI output, drop duplicates, apply the size filter. Returns (kept, excluded)."""
     seen, rows = set(), []
     for item in data:
@@ -222,7 +226,7 @@ TASK: List companies that operate in India in this industry: {industry}, and tha
 EVIDENCE: numbered web search results below. Prefer companies named in them. You may add well-known companies from your own knowledge only if you are confident they belong in this industry and size band; for those, set source_url to an empty string.
 
 RULES:
-- Return up to 30 distinct companies. No duplicates.
+- Return up to 35 distinct companies. No duplicates.
 - Use the name people use in the market. If it is a brand of a larger parent, mention the parent in business_profile.
 - size_band must be exactly one of: "1,000 to 5,000", "5,000 to 20,000", "20,000+", "Unknown".
 - If a headcount appears in the results, put that figure in size_evidence and use it to choose size_band. Otherwise give your best estimate and set size_evidence to "Estimate, to be verified". Use "Unknown" if you cannot tell.
@@ -259,11 +263,203 @@ def run_discovery(industry, size, log):
         raise RuntimeError("The searches returned nothing. Check the Serper key and try again.")
     log("Step 2 of 2: the AI is reading the results and listing companies...")
     kept, excluded, model = discover_companies(industry, size, results)
-    return {"industry": industry, "size": size, "companies": kept, "excluded": excluded,
-            "results": results, "queries": queries, "model": model}
+    return {"run_id": time.time(), "industry": industry, "size": size, "companies": kept,
+            "excluded": excluded, "results": results, "queries": queries, "model": model}
+
+
+# ---------------- Stage 4: company details ----------------
+FRONTLINE_SHARE = {"Quick Commerce": 0.70, "Retail": 0.78, "Logistics": 0.78, "BFSI": 0.50, "Healthcare": 0.58}
+ROLE_HINTS = {
+    "Quick Commerce": "delivery partners, dark store pickers and packers, dark store managers, rider supervisors",
+    "Retail": "store associates, cashiers, sales executives, visual merchandisers, store managers",
+    "Logistics": "drivers, delivery executives, warehouse associates, sorters, hub staff, fleet supervisors",
+    "BFSI": "sales executives, relationship officers, collections agents, branch staff, telecallers",
+    "Healthcare": "nurses, ward staff, paramedics, front desk staff, lab technicians, hospital support staff",
+}
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def band_for(n):
+    if n < 1000:
+        return "Below 1,000"
+    if n <= 5000:
+        return "1,000 to 5,000"
+    if n <= 20000:
+        return "5,000 to 20,000"
+    return "20,000+"
+
+
+def build_evidence(raw):
+    """Turn one Serper response into short evidence text plus the list of links it contains."""
+    parts, urls = [], []
+    kg = raw.get("knowledgeGraph") or {}
+    if kg:
+        attrs = kg.get("attributes") or {}
+        attr_text = "; ".join(f"{k}: {v}" for k, v in attrs.items())
+        site = kg.get("website", "")
+        parts.append(f"Knowledge panel: {kg.get('title', '')} - {kg.get('description', '')} "
+                     f"{attr_text} (source: {site})")
+        if site:
+            urls.append(site)
+    for item in (raw.get("organic") or [])[:6]:
+        link = item.get("link", "")
+        if link:
+            urls.append(link)
+        parts.append(f"- {item.get('title', '')[:120]} | {item.get('snippet', '')[:260]} | {link}")
+    return "\n".join(parts)[:2200], urls
+
+
+def enrich_batch(industry, batch):
+    blocks = [f"### COMPANY {i}: {b['name']}\n{b['evidence']}" for i, b in enumerate(batch, 1)]
+    prompt = f"""You are extracting facts about companies for a sales prospect database. Industry: {industry}.
+
+For each company below, use ONLY the evidence text given for that company when stating employees, locations and footprint. Do not use outside knowledge for those three. If the evidence does not say, use null, an empty list or an empty string.
+
+Return a JSON array with exactly one object per company, in the same order, with these keys:
+- company: the exact company name given
+- employees: integer total headcount if a figure appears in the evidence, else null. If several figures appear, use the most recent and most reliable one.
+- employees_note: short note such as "FY24 global headcount", "India only", "gig partners counted separately". Empty if employees is null.
+- employees_source_url: a link copied exactly from that company's evidence that supports the figure, else ""
+- employees_confidence: "High" if the figure is recent and from the company, an annual report or reputable news; "Medium" if from an aggregator or dated; "Low" if vague or approximate; "" if employees is null
+- locations: array of up to 12 cities, states or regions where the evidence shows the company operates
+- footprint: short text such as "300+ dark stores in 25 cities" only if stated in the evidence, else ""
+- frontline_roles: array of 3 to 6 frontline job categories typical for this business. You may use general industry knowledge here. Typical roles for this industry: {ROLE_HINTS[industry]}
+- recruitment_needs: one sentence on the likely recruitment requirement, based on the business model and evidence
+
+COMPANIES AND EVIDENCE:
+{chr(10).join(blocks)}
+"""
+    text, model = gemini_generate(prompt, json_mode=True, timeout=100, max_models=4, prefer_lite=True)
+    return parse_json_list(text), model
+
+
+def as_list(v, limit):
+    if isinstance(v, str):
+        v = [v] if v.strip() else []
+    if not isinstance(v, list):
+        return []
+    return [str(x).strip() for x in v if str(x).strip()][:limit]
+
+
+def clean_enrichment(item, urls):
+    n = item.get("employees")
+    try:
+        n = int(float(str(n).replace(",", ""))) if n not in (None, "", False) else None
+    except Exception:
+        n = None
+    if n is not None and n <= 0:
+        n = None
+    src = str(item.get("employees_source_url", "")).strip()
+    if n is not None and src not in urls:
+        n, src = None, ""  # no valid source link, so the figure is not accepted
+    conf = str(item.get("employees_confidence", "")).strip().title() if n else ""
+    if conf not in ("High", "Medium", "Low"):
+        conf = "Low" if n else ""
+    return {
+        "employees": n,
+        "employees_note": str(item.get("employees_note", "")).strip() if n else "",
+        "employees_source_url": src if n else "",
+        "employees_confidence": conf,
+        "locations": as_list(item.get("locations"), 12),
+        "footprint": str(item.get("footprint", "")).strip(),
+        "frontline_roles": as_list(item.get("frontline_roles"), 6),
+        "recruitment_needs": str(item.get("recruitment_needs", "")).strip(),
+    }
+
+
+def assemble_final(candidates, enrichments, industry, size, cap=25):
+    share = FRONTLINE_SHARE[industry]
+    verified, unverified, excluded = [], [], []
+    for c in candidates:
+        e = enrichments.get(c["Company"]) or {}
+        n = e.get("employees")
+        row = {
+            "Company": c["Company"],
+            "Business profile": c["Business profile"],
+            "Business model": c["Business model"],
+            "HQ": c["HQ"],
+            "Employees": n,
+            "Confidence": e.get("employees_confidence", ""),
+            "Headcount note": e.get("employees_note", ""),
+            "Employee source": e.get("employees_source_url", ""),
+            "Est. frontline (estimate)": int(round(n * share, -2)) if n else None,
+            "Frontline share assumed": f"{int(share * 100)}%" if n else "",
+            "Operating locations": ", ".join(e.get("locations", [])),
+            "Footprint (as stated)": e.get("footprint", ""),
+            "Frontline roles (inferred)": ", ".join(e.get("frontline_roles", [])),
+            "Potential recruitment needs (inferred)": e.get("recruitment_needs", ""),
+            "Size status": "",
+            "Website": c["Website"],
+            "Stage 3 source": c["Source"],
+        }
+        if n:
+            band = band_for(n)
+            if band == size:
+                row["Size status"] = "Verified"
+                verified.append(row)
+            else:
+                row["Size status"] = f"Headcount {n:,} is {band}"
+                excluded.append(row)
+        else:
+            row["Size status"] = "Size unverified"
+            unverified.append(row)
+    rank = {"High": 0, "Medium": 1, "Low": 2}
+    verified.sort(key=lambda r: rank.get(r["Confidence"], 3))
+    return (verified + unverified)[:cap], excluded
+
+
+def run_enrichment(disc, log):
+    industry, size = disc["industry"], disc["size"]
+    cands = disc["companies"]
+    items, evidence_log, warnings = [], {}, []
+    for i, c in enumerate(cands, 1):
+        name = c["Company"]
+        log(f"Searching facts: {name} ({i} of {len(cands)})")
+        q = f"{name} number of employees headcount stores warehouses cities India"
+        try:
+            raw = serper_raw(q, 8)
+        except Exception as ex:
+            raw = {}
+            warnings.append(f"Search failed for {name}: {ex}")
+        evidence, urls = build_evidence(raw)
+        items.append({"name": name, "evidence": evidence or "No search results.", "urls": set(urls)})
+        evidence_log[name] = {"query": q, "links": urls}
+
+    enrichments, model = {}, ""
+    for start in range(0, len(items), 5):
+        batch = items[start:start + 5]
+        log(f"AI is reading the evidence: companies {start + 1} to {start + len(batch)}...")
+        try:
+            data, model = enrich_batch(industry, batch)
+            by_name = {norm(d.get("company", "")): d for d in data if isinstance(d, dict)}
+            for j, b in enumerate(batch):
+                d = by_name.get(norm(b["name"]))
+                if d is None and len(data) == len(batch) and isinstance(data[j], dict):
+                    d = data[j]
+                if d:
+                    enrichments[b["name"]] = clean_enrichment(d, b["urls"])
+        except Exception as ex:
+            warnings.append(f"AI step failed for companies {start + 1} to {start + len(batch)}: {ex}")
+        time.sleep(1)
+
+    final, excluded = assemble_final(cands, enrichments, industry, size)
+    return {"run_id": disc["run_id"], "industry": industry, "size": size, "rows": final,
+            "excluded": excluded, "evidence": evidence_log, "warnings": warnings, "model": model}
 
 
 # ---------------- Page ----------------
+LINK_COLUMNS = {
+    "Website": st.column_config.LinkColumn("Website"),
+    "Source": st.column_config.LinkColumn("Source"),
+    "Employee source": st.column_config.LinkColumn("Employee source"),
+    "Stage 3 source": st.column_config.LinkColumn("Stage 3 source"),
+    "Employees": st.column_config.NumberColumn("Employees", format="%d"),
+    "Est. frontline (estimate)": st.column_config.NumberColumn("Est. frontline (estimate)", format="%d"),
+}
+
 st.title("Hunar Select: Recruitment Intelligence Engine")
 st.caption("Pick an industry and company size. The system finds target companies, hiring signals and decision-makers.")
 
@@ -273,53 +469,88 @@ size = col2.selectbox("Company size (employees)", SIZE_BANDS)
 col3.text_input("Geography", value="India", disabled=True)
 
 if st.button("Run research", type="primary"):
+    st.session_state.pop("enriched", None)
     with st.status("Researching...", expanded=True) as status:
         try:
             out = run_discovery(industry, size, st.write)
             st.session_state["discovery"] = out
-            status.update(label=f"Done. Found {len(out['companies'])} companies.", state="complete")
+            status.update(label=f"Done. Found {len(out['companies'])} candidate companies.", state="complete")
         except Exception as e:
             status.update(label="Research failed", state="error")
             st.error(str(e))
 
 disc = st.session_state.get("discovery")
+enr = st.session_state.get("enriched")
+if enr and disc and enr["run_id"] != disc["run_id"]:
+    enr = None
+
 if disc:
     if (disc["industry"], disc["size"]) != (industry, size):
-        st.warning(f"The table below is for {disc['industry']}, {disc['size']}. "
+        st.warning(f"The tables below are for {disc['industry']}, {disc['size']}. "
                    "Click Run research to generate the new selection.")
-    st.subheader(f"Prospect companies: {disc['industry']}, {disc['size']} employees, India")
-    companies = disc["companies"]
-    if not companies:
-        st.warning("No companies matched. Try another size band or run again.")
-    else:
-        n_unv = sum(1 for c in companies if c["Status"] == "Size unverified")
-        n_src = sum(1 for c in companies if c["Source"])
-        msg = f"{len(companies)} companies listed. {n_src} have a source link."
-        if n_unv:
-            msg += f" {n_unv} have an unverified size (Stage 4 will check headcount)."
-        if len(companies) < 25:
-            msg += f" Fewer than 25 qualified, so this is everything found."
-        st.caption(msg)
-        df = pd.DataFrame(companies)
-        df.insert(0, "#", range(1, len(df) + 1))
-        st.dataframe(
-            df,
-            hide_index=True,
-            column_config={
-                "Website": st.column_config.LinkColumn("Website"),
-                "Source": st.column_config.LinkColumn("Source"),
-            },
-        )
-        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
-                           file_name="companies.csv", mime="text/csv")
 
-    with st.expander("Companies left out (size band did not match)"):
-        if disc["excluded"]:
-            st.dataframe(pd.DataFrame(disc["excluded"])[["Company", "Size band (est.)", "Size evidence"]],
-                         hide_index=True)
+    if not enr:
+        st.info("Step 1 is done. Click the button below to add company details (headcount, locations, "
+                "frontline estimate). This takes about 2 to 4 minutes.")
+        if st.button("Step 2: Add company details", type="primary"):
+            with st.status("Adding company details...", expanded=True) as status2:
+                try:
+                    enr = run_enrichment(disc, st.write)
+                    st.session_state["enriched"] = enr
+                    status2.update(label="Details added.", state="complete")
+                    st.rerun()
+                except Exception as e:
+                    status2.update(label="Adding details failed", state="error")
+                    st.error(str(e))
+
+    if enr:
+        st.subheader(f"Prospect companies: {enr['industry']}, {enr['size']} employees, India")
+        rows = enr["rows"]
+        n_ver = sum(1 for r in rows if r["Size status"] == "Verified")
+        n_unv = sum(1 for r in rows if r["Size status"] == "Size unverified")
+        msg = f"{len(rows)} companies listed. {n_ver} have a sourced headcount inside this size band."
+        if n_unv:
+            msg += f" {n_unv} have no sourced headcount yet (size unverified)."
+        if len(rows) < 25:
+            msg += " Fewer than 25 qualified, so this is everything found."
+        st.caption(msg + " Blank means Not found. Frontline numbers are estimates.")
+        for w in enr["warnings"]:
+            st.warning(w)
+        df = pd.DataFrame(rows)
+        df.insert(0, "#", range(1, len(df) + 1))
+        st.dataframe(df, hide_index=True, column_config=LINK_COLUMNS)
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                           file_name="prospects.csv", mime="text/csv")
+        with st.expander("Companies left out after headcount check"):
+            if enr["excluded"]:
+                st.dataframe(pd.DataFrame(enr["excluded"])[["Company", "Employees", "Size status", "Employee source"]],
+                             hide_index=True, column_config=LINK_COLUMNS)
+            else:
+                st.write("None.")
+        with st.expander("Evidence used for each company"):
+            ev = [{"Company": k, "Search": v["query"], "Links": "  ".join(v["links"][:4])}
+                  for k, v in enr["evidence"].items()]
+            st.dataframe(pd.DataFrame(ev), hide_index=True)
+            st.caption(f"AI model used: {enr['model']}")
+
+    companies = disc["companies"]
+    with st.expander("Step 1 results: candidate companies", expanded=not enr):
+        if not companies:
+            st.warning("No companies matched. Try another size band or run again.")
         else:
-            st.write("None.")
-    with st.expander("Sources used for this research"):
+            n_unv = sum(1 for c in companies if c["Status"] == "Size unverified")
+            n_src = sum(1 for c in companies if c["Source"])
+            msg = f"{len(companies)} candidates. {n_src} have a source link."
+            if n_unv:
+                msg += f" {n_unv} have an unverified size."
+            st.caption(msg)
+            cdf = pd.DataFrame(companies)
+            cdf.insert(0, "#", range(1, len(cdf) + 1))
+            st.dataframe(cdf, hide_index=True, column_config=LINK_COLUMNS)
+        if disc["excluded"]:
+            st.caption("Left out in Step 1 (estimated size band did not match): "
+                       + ", ".join(e["Company"] for e in disc["excluded"]))
+    with st.expander("Step 1 sources: searches and links"):
         st.write("Searches run: " + " | ".join(disc["queries"]))
         st.caption(f"AI model used: {disc['model']}")
         st.dataframe(pd.DataFrame(disc["results"])[["title", "link", "query"]], hide_index=True,
