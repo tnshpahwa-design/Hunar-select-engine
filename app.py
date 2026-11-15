@@ -37,9 +37,6 @@ INDUSTRY_SEGMENTS = {
 
 # ---------------- Shared helpers ----------------
 def get_secret(name):
-    ui_val = st.session_state.get(f"ui_secret_{name}")
-    if ui_val and str(ui_val).strip():
-        return str(ui_val).strip()
     try:
         return st.secrets[name]
     except Exception:
@@ -83,8 +80,7 @@ def order_models(names, prefer_lite=False, pinned=None):
 
 
 def gemini_generate(prompt, json_mode=False, timeout=40, max_models=6, prefer_lite=False):
-    """Ask Gemini. Tries several Flash models, skips quickly on quota errors, retries when busy.
-    Returns (text, model_used). Raises RuntimeError listing every attempt if all fail."""
+    """Ask Gemini. Tries several Flash models, skips quickly on quota errors, retries when busy."""
     key = get_secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY not found in Secrets.")
@@ -128,13 +124,13 @@ def gemini_generate(prompt, json_mode=False, timeout=40, max_models=6, prefer_li
             if resp.status_code in (500, 503) and attempt == 0:
                 time.sleep(3)
                 continue
-            break  # 429 (quota) and other errors: go to the next model straight away
+            break
     raise RuntimeError("All Gemini models were busy or failed. Tried: " + "; ".join(attempts))
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def serper_raw(query, num=10):
-    """Google search through Serper (India results). Cached for 24 hours to save free credits."""
+    """Google search through Serper (India results). Cached for 24 hours."""
     key = get_secret("SERPER_API_KEY")
     if not key:
         raise RuntimeError("SERPER_API_KEY not found in Secrets.")
@@ -150,7 +146,7 @@ def serper_search(query, num=10):
     return serper_raw(query, num).get("organic", [])
 
 
-# ---------------- Stage 3: company discovery ----------------
+# ---------------- Stage 1: company discovery ----------------
 def build_queries(industry, size):
     primary, alts = INDUSTRY_SEGMENTS[industry]
     queries = [
@@ -173,7 +169,7 @@ def parse_json_list(text):
     except Exception:
         s, e = t.find("["), t.rfind("]")
         if s == -1 or e <= s:
-            raise RuntimeError("The AI reply was not valid JSON. Try Run research again.")
+            raise RuntimeError("The AI reply was not valid JSON. Try Launch Research again.")
         data = json.loads(t[s:e + 1])
     if isinstance(data, dict):
         lists = [v for v in data.values() if isinstance(v, list)]
@@ -182,7 +178,6 @@ def parse_json_list(text):
 
 
 def with_retry(fn, *args, tries=2, wait=15):
-    """Run an AI step again after a short pause if every model was busy or the reply was unusable."""
     last = None
     for i in range(tries):
         try:
@@ -204,7 +199,6 @@ def normalise_url(u):
 
 
 def process_companies(data, valid_urls, size, cap=50):
-    """Clean the AI output, drop duplicates, apply the size filter. Returns (kept, excluded)."""
     seen, rows = set(), []
     for item in data:
         if not isinstance(item, dict):
@@ -218,7 +212,7 @@ def process_companies(data, valid_urls, size, cap=50):
         seen.add(key)
         src = str(item.get("source_url", "")).strip()
         if src not in valid_urls:
-            src = ""  # a source must be a real search result, never invented
+            src = ""
         band = str(item.get("size_band", "Unknown")).strip()
         if band not in SIZE_BANDS:
             band = "Unknown"
@@ -248,7 +242,7 @@ def process_companies(data, valid_urls, size, cap=50):
                 and abs(pos[r["Size band (est.)"]] - pos[size]) == 1]
     excluded = [r for r in rows if r["Size band (est.)"] in pos and r["Size band (est.)"] != size
                 and abs(pos[r["Size band (est.)"]] - pos[size]) > 1]
-    matched.sort(key=lambda r: 0 if r["Source"] else 1)  # sourced companies first
+    matched.sort(key=lambda r: 0 if r["Source"] else 1)
     kept = (matched + unknown + adjacent)[:cap]
     return kept, excluded
 
@@ -296,7 +290,7 @@ def discover_companies(industry, size, results):
                                   timeout=100, max_models=4, prefer_lite=True)
     data = parse_json_list(text)
     kept, excluded = process_companies(data, valid_urls, size)
-    if len(kept) < 40:  # second pass to widen the pool
+    if len(kept) < 40:
         try:
             already = [c["Company"] for c in kept] + [e["Company"] for e in excluded]
             text2, _ = gemini_generate(discovery_prompt(industry, size, evidence, already), json_mode=True,
@@ -328,7 +322,7 @@ def run_discovery(industry, size, log):
             "excluded": excluded, "results": results, "queries": queries, "model": model}
 
 
-# ---------------- Stage 4: company details ----------------
+# ---------------- Stage 2: company details ----------------
 FRONTLINE_SHARE = {"Quick Commerce": 0.70, "Retail": 0.78, "Logistics": 0.78, "BFSI": 0.50, "Healthcare": 0.58}
 ROLE_HINTS = {
     "Quick Commerce": "delivery partners, dark store pickers and packers, dark store managers, rider supervisors",
@@ -358,7 +352,6 @@ def band_for(n):
 
 
 def build_evidence(raw):
-    """Turn one Serper response into short evidence text plus the list of links it contains."""
     parts, urls = [], []
     kg = raw.get("knowledgeGraph") or {}
     if kg:
@@ -540,7 +533,7 @@ def run_enrichment(disc, log):
                     merged[k] = e2[k]
                 for k in ("locations", "footprint", "frontline_roles", "recruitment_needs"):
                     if not merged.get(k):
-                        merged[k] = e2.get(k)
+                        merged[k] = e2[k]
                 enrichments[name] = merged
 
     final, excluded = assemble_final(cands, enrichments, industry, size)
@@ -548,7 +541,7 @@ def run_enrichment(disc, log):
             "excluded": excluded, "evidence": evidence_log, "warnings": warnings, "model": model}
 
 
-# ---------------- Stage 5: hiring signals ----------------
+# ---------------- Stage 3: hiring signals ----------------
 SIGNAL_TYPES = {
     "S1": "Large-scale job openings",
     "S2": "New facility launch",
@@ -569,7 +562,6 @@ LOW_QUALITY_SIGNAL_DOMAINS = ("linkedin.com", "facebook.com", "naukri.com", "ind
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_news(query):
-    """Google News RSS (free, no key). Returns recent items with title, link, date and source."""
     url = f"[https://news.google.com/rss/search?q=](https://news.google.com/rss/search?q=){quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
     r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     if r.status_code != 200:
@@ -589,7 +581,6 @@ def fetch_news(query):
 
 
 def get_news(name):
-    """Two news searches per company: one on expansion, one on hiring. Company name is an exact phrase."""
     queries = [
         f'"{name}" India (expansion OR "new store" OR "new stores" OR warehouse OR "dark store" OR branches OR launch)',
         f'"{name}" India (hiring OR recruitment OR jobs OR "walk-in" OR vacancies OR "job creation")',
@@ -708,7 +699,6 @@ COMPANIES AND EVIDENCE:
 
 
 def check_level(level, ev):
-    """Code-side guardrail: hiring levels need hiring language in the source item."""
     text = f"{ev['title']} {ev['snippet']}"
     has_hiring = bool(HIRING_WORDS.search(text))
     if level in ("Confirmed", "Observed") and not has_hiring:
@@ -838,7 +828,7 @@ def run_signals(enr, log):
             "evidence": evidence_log, "warnings": warnings, "model": model, "diagnostics": diag}
 
 
-# ---------------- Stage 6: decision-makers and contacts ----------------
+# ---------------- Stage 4: decision-makers and contacts ----------------
 LINKEDIN_PROFILE = re.compile(r"linkedin\.com/(in|pub)/", re.I)
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?<!\d)(?:\+?91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}(?!\d)")
@@ -853,7 +843,6 @@ JUNIOR_RE = re.compile(r"\b(intern|trainee|associate|executive|recruiter|coordin
 
 
 def classify_persona(designation):
-    """Maps a job title to (persona label, priority). Priority 1 is best. None means not relevant."""
     d = (designation or "").lower().strip()
     if not d:
         return None
@@ -899,10 +888,14 @@ def clean_linkedin(url):
 def people_queries(name):
     return [
         f'site:[linkedin.com/in](https://linkedin.com/in) ("Head of Talent Acquisition" OR "Head of Recruitment" OR "Talent Acquisition Head" '
-        f'OR "Chief People Officer" OR CHRO OR "Chief Human Resources Officer") "{name}"',
-        f'site:[linkedin.com/in](https://linkedin.com/in) ("HR Operations" OR "Regional HR" OR "HR Head" OR "Head of HR" OR "Operations Head" '
-        f'OR "Business Head" OR "Regional Head") "{name}"',
+        f'OR "Chief People Officer" OR CHRO OR "Chief Human Resources Officer" OR "VP HR") "{name}"',
+        f'site:[linkedin.com/in](https://linkedin.com/in) ("HR Operations" OR "Regional HR" OR "HR Head" OR "Head of HR" OR "Director HR" '
+        f'OR "Operations Head" OR "Business Head") "{name}"',
     ]
+
+
+def fallback_people_query(name):
+    return f'site:[linkedin.com/in](https://linkedin.com/in) "{name}" ("Talent Acquisition" OR "Human Resources" OR "HR" OR "Recruitment" OR "People")'
 
 
 def contact_query(name):
@@ -942,7 +935,7 @@ def build_people_evidence(results):
         pid = f"P{k}"
         ev[pid] = {"title": r.get("title", ""), "snippet": r.get("snippet", ""), "link": clean_linkedin(link)}
         lines.append(f"{pid} | {r.get('title', '')[:140]} | {r.get('snippet', '')[:220]}")
-        if k >= 16:
+        if k >= 18:
             break
     return ev, "\n".join(lines)
 
@@ -993,7 +986,7 @@ def clean_person(item, company, ev_map, diag):
         return None
     return {"Company": company, "Name": name, "Designation": designation, "Persona": persona[0],
             "Priority": persona[1], "LinkedIn": ev["link"], "Email": "", "Phone": "",
-            "Contact status": "LinkedIn only", "Contact source": "",
+            "Contact status": "LinkedIn profile", "Contact source": "",
             "Relevance": str(item.get("relevance", "")).strip(),
             "Source note": "Public LinkedIn search result. Verify the current role before outreach."}
 
@@ -1045,14 +1038,28 @@ def run_decision_makers(enr, sig, log):
             "apollo_calls": 0, "apollo_emails_found": 0}
     warnings, items, evidence, contacts = [], [], {}, {}
     for i, name in enumerate(companies, 1):
-        log(f"Finding decision-makers: {name} ({i} of {len(companies)})")
+        log(f"Searching LinkedIn decision-makers: {name} ({i} of {len(companies)})")
         results = []
-        for q in people_queries(name):
+        used_queries = people_queries(name)
+        for q in used_queries:
             diag["searches"] += 1
             try:
                 results += serper_raw(q, 10).get("organic", [])
             except Exception as ex:
                 warnings.append(f"People search failed for {name}: {ex}")
+
+        ev_map, text = build_people_evidence(results)
+        # Broader LinkedIn X-Ray fallback if fewer than 3 profiles found
+        if len(ev_map) < 3:
+            fq = fallback_people_query(name)
+            used_queries.append(fq)
+            diag["searches"] += 1
+            try:
+                results += serper_raw(fq, 10).get("organic", [])
+                ev_map, text = build_people_evidence(results)
+            except Exception:
+                pass
+
         diag["searches"] += 1
         try:
             cres = serper_raw(contact_query(name), 8).get("organic", [])
@@ -1061,12 +1068,11 @@ def run_decision_makers(enr, sig, log):
             warnings.append(f"Contact search failed for {name}: {ex}")
         emails, phones = extract_company_contacts(name, cres)
         contacts[name] = {"emails": emails, "phones": phones}
-        ev_map, text = build_people_evidence(results)
         diag["linkedin_results"] += len(ev_map)
         ts = top_signal.get(name)
         context = (f"top hiring signal: {ts['Summary']} (locations: {ts['Locations'] or 'not stated'}). "
                    if ts else "no hiring signal found. ") + f"Operating locations: {rows[name].get('Operating locations') or 'not stated'}."
-        evidence[name] = {"queries": people_queries(name) + [contact_query(name)],
+        evidence[name] = {"queries": used_queries + [contact_query(name)],
                           "links": [v["link"] for v in ev_map.values()]}
         if ev_map:
             items.append({"name": name, "evidence": text, "ev_map": ev_map, "context": context})
@@ -1074,7 +1080,7 @@ def run_decision_makers(enr, sig, log):
     people_by, ta_counts, model = {}, {}, ""
     for start in range(0, len(items), 3):
         batch = items[start:start + 3]
-        log(f"AI is reading LinkedIn results: companies {start + 1} to {start + len(batch)} of {len(items)}...")
+        log(f"AI is verifying LinkedIn profiles: companies {start + 1} to {start + len(batch)} of {len(items)}...")
         try:
             data, model = with_retry(extract_people_batch, batch)
             maps = {norm(b["name"]): b for b in batch}
@@ -1101,13 +1107,12 @@ def run_decision_makers(enr, sig, log):
         ta_counts[name] = sum(1 for p in uniq if p["Priority"] == 1)
         people_by[name] = uniq[:6]
 
-    # Optional contact lookups for the strongest companies only
     order = [s["Company"] for s in sig["summary"]]
     try:
         hunter_n = int(get_secret("HUNTER_MAX_COMPANIES") or 10)
-        apollo_n = int(get_secret("APOLLO_MAX_CONTACTS") or 15)
+        apollo_n = int(get_secret("APOLLO_MAX_CONTACTS") or 6)
     except Exception:
-        hunter_n, apollo_n = 10, 15
+        hunter_n, apollo_n = 10, 6
     if get_secret("HUNTER_API_KEY"):
         for name in order[:hunter_n]:
             domain = domain_of(rows[name].get("Website") or "")
@@ -1153,7 +1158,7 @@ def run_decision_makers(enr, sig, log):
             for p in sorted(people_by.get(name, []), key=lambda p: p["Priority"]):
                 if stop or used >= apollo_n:
                     break
-                if p["Email"] or not p["LinkedIn"] or p["Priority"] > 4:
+                if p["Email"] or not p["LinkedIn"] or p["Priority"] > 3:
                     continue
                 log(f"Looking up work email (Apollo): {p['Name']}")
                 used += 1
@@ -1179,47 +1184,7 @@ def run_decision_makers(enr, sig, log):
             "evidence": evidence, "warnings": warnings, "model": model, "diagnostics": diag}
 
 
-def enrich_loaded_with_apollo(log):
-    """On-demand Apollo enrichment for already-loaded decision-makers without re-running Stages 1-4."""
-    S = st.session_state
-    if "dm" not in S or "enr" not in S:
-        return 0
-    rows = {r["Company"]: r for r in S["enr"]["rows"]}
-    order = [r["Company"] for r in S.get("score", {}).get("rows", [])] or list(rows.keys())
-    try:
-        apollo_n = int(get_secret("APOLLO_MAX_CONTACTS") or 15)
-    except Exception:
-        apollo_n = 15
-    used, found_count = 0, 0
-    for name in order:
-        domain = domain_of(rows.get(name, {}).get("Website") or "")
-        c_people = [p for p in S["dm"]["people"] if p["Company"] == name]
-        for p in sorted(c_people, key=lambda x: x["Priority"]):
-            if used >= apollo_n:
-                break
-            if p.get("Email") or not p.get("LinkedIn") or p.get("Priority", 9) > 4:
-                continue
-            log(f"Apollo lookup: {p['Name']} ({name})...")
-            used += 1
-            res, err = apollo_match(p["Name"], p["LinkedIn"], domain)
-            if err:
-                S["dm"]["warnings"].append(err)
-                break
-            if res and (res["email"] or res["phone"]):
-                if res["email"]:
-                    found_count += 1
-                    p["Email"] = res["email"]
-                    p["Contact status"] = "Email found (Apollo)"
-                    p["Contact source"] = f"Apollo, email status: {res['status'] or 'unknown'}"
-                if res["phone"]:
-                    p["Phone"] = res["phone"]
-    if "sig" in S:
-        S["score"] = run_scoring(S["enr"], S["sig"], S["dm"])
-    save_run()
-    return found_count
-
-
-# ---------------- Stage 7: scoring ----------------
+# ---------------- Stage 5: scoring ----------------
 WEIGHTS = [("Hiring intensity", 0.20), ("Open positions / hiring volume", 0.15), ("Frontline workforce", 0.15),
            ("Geographic expansion", 0.10), ("Urgency of hiring", 0.15), ("Outsourcing potential", 0.15),
            ("Decision-maker accessibility", 0.10)]
@@ -1353,7 +1318,7 @@ def outreach_angle(row, sigs, people):
         p = sorted(people, key=lambda p: (p["Priority"], 0 if (p["Email"] or p["Phone"]) else 1))[0]
         text += f" Approach {p['Name']} ({p['Designation']})."
     else:
-        text += " No decision-maker found yet: search LinkedIn for the Head of Talent Acquisition."
+        text += " Search LinkedIn for the Head of Talent Acquisition."
     return text
 
 
@@ -1376,12 +1341,12 @@ def run_scoring(enr, sig, dm):
             b = best[0]
             contact_text = f"{b['Name']} ({b['Designation']})" + (f" | {b['Email']}" if b["Email"] else "")
         elif contacts.get("emails"):
-            contact_text = f"Company recruitment email: {contacts['emails'][0]['value']}"
+            contact_text = f"Company HR: {contacts['emails'][0]['value']}"
         all_dms_text = " | ".join(
             f"{p['Name']} ({p['Designation']} - {p['Persona']}) [{p['LinkedIn']}]"
             + (f" <{p['Email']}>" if p.get("Email") else "")
             for p in people
-        ) or "None mapped"
+        ) or "None found"
         urgency = "High" if res["urgency_score"] >= 70 else "Medium" if res["urgency_score"] >= 40 else "Low" \
             if res["urgency_score"] > 0 else "None"
         out.append({
@@ -1401,7 +1366,7 @@ def run_scoring(enr, sig, dm):
     return {"run_id": enr["run_id"], "rows": out, "breakdowns": breakdowns}
 
 
-# ---------------- Stage 8: one-click pipeline and saved runs ----------------
+# ---------------- Stage 6: pipeline & saved runs ----------------
 RUN_KEYS = ("disc", "enr", "sig", "dm", "score")
 SAVE_DIR = "saved_runs"
 
@@ -1447,7 +1412,7 @@ def run_all(industry, size, log, resume=False):
         S["sig"] = run_signals(S["enr"], log)
         save_run()
     if "dm" not in S:
-        log("STEP 4 of 5: decision-makers and contacts")
+        log("STEP 4 of 5: LinkedIn decision-makers and contacts")
         S["dm"] = run_decision_makers(S["enr"], S["sig"], log)
         save_run()
     if "score" not in S:
@@ -1456,400 +1421,263 @@ def run_all(industry, size, log, resume=False):
         save_run()
 
 
-# ---------------- Page (Modern B2B SaaS UI Layer) ----------------
+# ---------------- Clean B2B SaaS UI ----------------
 def esc(val):
     return _html.escape(str(val or ""))
 
 
-def inject_saas_theme():
-    st.markdown("""
-    <style>
-    @import url('[https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap](https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap)');
-
-    :root {
-        --bg-canvas: #F8FAFC;
-        --bg-card: #FFFFFF;
-        --border-subtle: #E2E8F0;
-        --border-hover: #CBD5E1;
-        --text-primary: #0F172A;
-        --text-secondary: #475569;
-        --text-muted: #64748B;
-        --accent-indigo: #4F46E5;
-        --accent-indigo-soft: #EEF2FF;
-    }
-
-    html, body, [class*="css"] {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-        color: var(--text-primary);
-    }
-
-    .stApp {
-        background-color: var(--bg-canvas);
-    }
-
-    h1, h2, h3, .saas-title {
-        font-family: 'Plus Jakarta Sans', sans-serif !important;
-        letter-spacing: -0.025em;
-    }
-
-    .block-container {
-        padding-top: 2rem !important;
-        padding-bottom: 4rem !important;
-        max-width: 1280px !important;
-    }
-
-    @keyframes fadeInUp {
-        from { opacity: 0; transform: translateY(10px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-
-    .saas-hero {
-        background: linear-gradient(135deg, #0F172A 0%, #1E1B4B 60%, #312E81 100%);
-        border-radius: 18px;
-        padding: 28px 32px;
-        color: #FFFFFF;
-        margin-bottom: 20px;
-        box-shadow: 0 12px 30px -8px rgba(15, 23, 42, 0.25);
-        animation: fadeInUp 0.4s ease-out;
-        position: relative;
-        overflow: hidden;
-    }
-    .saas-hero-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: rgba(255, 255, 255, 0.12);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        padding: 4px 12px;
-        border-radius: 999px;
-        font-size: 12px;
-        font-weight: 600;
-        letter-spacing: 0.03em;
-        text-transform: uppercase;
-        color: #C7D2FE;
-        margin-bottom: 12px;
-    }
-    .saas-hero h1 {
-        color: #FFFFFF !important;
-        font-size: 28px !important;
-        font-weight: 800 !important;
-        margin: 0 0 6px 0 !important;
-        line-height: 1.2 !important;
-    }
-    .saas-hero p {
-        color: #CBD5E1;
-        font-size: 14.5px;
-        margin: 0;
-        max-width: 720px;
-        line-height: 1.5;
-    }
-
-    .bento-grid {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 14px;
-        margin: 16px 0 22px 0;
-        animation: fadeInUp 0.45s ease-out;
-    }
-    .bento-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border-subtle);
-        border-radius: 14px;
-        padding: 16px 20px;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
-        transition: all 0.2s ease;
-    }
-    .bento-card:hover {
-        border-color: var(--border-hover);
-        transform: translateY(-2px);
-        box-shadow: 0 8px 20px -6px rgba(15, 23, 42, 0.08);
-    }
-    .bento-label {
-        font-size: 12px;
-        font-weight: 600;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        margin-bottom: 6px;
-    }
-    .bento-value {
-        font-family: 'Plus Jakarta Sans', sans-serif;
-        font-size: 26px;
-        font-weight: 800;
-        color: var(--text-primary);
-        line-height: 1.1;
-    }
-    .bento-sub {
-        font-size: 12px;
-        color: var(--text-secondary);
-        margin-top: 4px;
-    }
-
-    .prospect-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border-subtle);
-        border-radius: 16px;
-        padding: 20px 24px;
-        margin-bottom: 14px;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
-        transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-        animation: fadeInUp 0.35s ease-out both;
-    }
-    .prospect-card:hover {
-        border-color: #A5B4FC;
-        transform: translateY(-2px);
-        box-shadow: 0 12px 24px -8px rgba(79, 70, 229, 0.12);
-    }
-    .card-top {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        gap: 16px;
-        flex-wrap: wrap;
-        margin-bottom: 14px;
-    }
-    .rank-pill {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        font-weight: 600;
-        background: #F1F5F9;
-        color: #334155;
-        padding: 3px 9px;
-        border-radius: 8px;
-        margin-right: 8px;
-    }
-    .company-name {
-        font-family: 'Plus Jakarta Sans', sans-serif;
-        font-size: 18px;
-        font-weight: 700;
-        color: var(--text-primary);
-        text-decoration: none;
-    }
-    .badge {
-        display: inline-flex;
-        align-items: center;
-        padding: 3px 10px;
-        border-radius: 999px;
-        font-size: 11.5px;
-        font-weight: 600;
-        margin-left: 6px;
-    }
-    .tier-P1 { background: #ECFDF5; color: #047857; border: 1px solid #A7F3D0; }
-    .tier-P2 { background: #EEF2FF; color: #4338CA; border: 1px solid #C7D2FE; }
-    .tier-P3 { background: #FFFBEB; color: #B45309; border: 1px solid #FDE68A; }
-    .tier-P4 { background: #F1F5F9; color: #475569; border: 1px solid #E2E8F0; }
-
-    .urg-High { background: #FFF1F2; color: #BE123C; }
-    .urg-Medium { background: #FFFBEB; color: #B45309; }
-    .urg-Low, .urg-None { background: #F1F5F9; color: #64748B; }
-
-    .ev-Confirmed { background: #ECFDF5; color: #047857; }
-    .ev-Observed { background: #EFF6FF; color: #1D4ED8; }
-    .ev-Inferred { background: #F8FAFC; color: #475569; border: 1px solid #E2E8F0; }
-
-    .score-box {
-        text-align: right;
-        min-width: 150px;
-    }
-    .score-num {
-        font-family: 'Plus Jakarta Sans', sans-serif;
-        font-size: 20px;
-        font-weight: 800;
-        color: var(--accent-indigo);
-    }
-    .score-bar-bg {
-        width: 140px;
-        height: 6px;
-        background: #E2E8F0;
-        border-radius: 999px;
-        overflow: hidden;
-        margin-left: auto;
-        margin-top: 4px;
-    }
-    .score-bar-fill {
-        height: 100%;
-        background: linear-gradient(90deg, #4F46E5, #06B6D4);
-        border-radius: 999px;
-    }
-
-    .metrics-strip {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 10px;
-        background: #F8FAFC;
-        border: 1px solid #F1F5F9;
-        border-radius: 12px;
-        padding: 10px 14px;
-        margin-bottom: 12px;
-    }
-    .m-item span {
-        display: block;
-        font-size: 11px;
-        color: var(--text-muted);
-        font-weight: 500;
-    }
-    .m-item strong {
-        font-size: 13.5px;
-        color: var(--text-primary);
-        font-weight: 600;
-    }
-
-    .signal-callout {
-        background: #FAFAFF;
-        border-left: 3px solid var(--accent-indigo);
-        padding: 10px 14px;
-        border-radius: 0 10px 10px 0;
-        font-size: 13px;
-        color: var(--text-secondary);
-        margin-bottom: 12px;
-    }
-
-    /* Multi-level Stakeholder Pills Strip */
-    .stakeholder-section {
-        margin-bottom: 12px;
-    }
-    .stakeholder-header {
-        font-size: 11px;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        color: var(--text-muted);
-        margin-bottom: 6px;
-    }
-    .stakeholder-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-        gap: 8px;
-    }
-    .dm-chip {
-        background: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        border-radius: 10px;
-        padding: 8px 12px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 8px;
-        transition: border-color 0.15s ease;
-    }
-    .dm-chip:hover {
-        border-color: #A5B4FC;
-        background: #FFFFFF;
-    }
-    .dm-persona-tag {
-        display: inline-block;
-        font-size: 10px;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
-        color: #4338CA;
-        background: #EEF2FF;
-        padding: 2px 6px;
-        border-radius: 5px;
-        margin-bottom: 3px;
-    }
-    .dm-chip-name {
-        font-size: 13px;
-        font-weight: 700;
-        color: #0F172A;
-        line-height: 1.2;
-    }
-    .dm-chip-role {
-        font-size: 11.5px;
-        color: #64748B;
-        line-height: 1.25;
-    }
-    .dm-chip-contact {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 10.5px;
-        color: #047857;
-        background: #ECFDF5;
-        padding: 2px 6px;
-        border-radius: 5px;
-        margin-top: 3px;
-        display: inline-block;
-    }
-    .li-mini-btn {
-        font-size: 11px;
-        font-weight: 600;
-        color: #0A66C2 !important;
-        background: #EFF6FF;
-        border: 1px solid #BFDBFE;
-        padding: 4px 8px;
-        border-radius: 7px;
-        text-decoration: none !important;
-        white-space: nowrap;
-    }
-    .li-mini-btn:hover {
-        background: #DBEAFE;
-    }
-
-    .card-footer {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: 10px;
-        padding-top: 10px;
-        border-top: 1px solid #F1F5F9;
-        font-size: 12.5px;
-        color: var(--text-secondary);
-    }
-    .action-link {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 5px 12px;
-        border-radius: 8px;
-        background: var(--accent-indigo-soft);
-        color: var(--accent-indigo) !important;
-        font-weight: 600;
-        font-size: 12px;
-        text-decoration: none !important;
-        transition: background 0.15s ease;
-    }
-    .action-link:hover {
-        background: #E0E7FF;
-    }
-
-    div.stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #4F46E5 0%, #4338CA 100%) !important;
-        border: none !important;
-        border-radius: 10px !important;
-        font-weight: 600 !important;
-        padding: 0.55rem 1.25rem !important;
-        box-shadow: 0 4px 12px rgba(79, 70, 229, 0.25) !important;
-        transition: all 0.2s ease !important;
-    }
-    div.stButton > button[kind="primary"]:hover {
-        transform: translateY(-1px) !important;
-        box-shadow: 0 6px 16px rgba(79, 70, 229, 0.35) !important;
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-        background: #FFFFFF;
-        padding: 6px;
-        border-radius: 12px;
-        border: 1px solid var(--border-subtle);
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px;
-        padding: 8px 16px;
-        font-weight: 600;
-        font-size: 13.5px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+def render_html(raw_html):
+    """Strip line indentation so Streamlit Markdown never renders HTML as a code block."""
+    clean = "\n".join(line.strip() for line in raw_html.strip().splitlines() if line.strip())
+    st.markdown(clean, unsafe_allow_html=True)
 
 
-inject_saas_theme()
+render_html("""
+<style>
+@import url('[https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap](https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap)');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #0F172A;
+}
+.stApp {
+    background-color: #F8FAFC;
+}
+h1, h2, h3 {
+    font-family: 'Plus Jakarta Sans', sans-serif !important;
+    letter-spacing: -0.02em;
+}
+.block-container {
+    padding-top: 2rem !important;
+    padding-bottom: 3rem !important;
+    max-width: 1240px !important;
+}
+.saas-hero {
+    background: linear-gradient(135deg, #0F172A 0%, #1E1B4B 60%, #312E81 100%);
+    border-radius: 16px;
+    padding: 24px 28px;
+    color: #FFFFFF;
+    margin-bottom: 18px;
+    box-shadow: 0 10px 25px -8px rgba(15, 23, 42, 0.25);
+}
+.saas-hero h1 {
+    color: #FFFFFF !important;
+    font-size: 26px !important;
+    font-weight: 800 !important;
+    margin: 0 0 6px 0 !important;
+}
+.saas-hero p {
+    color: #CBD5E1;
+    font-size: 14px;
+    margin: 0;
+}
+.bento-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin: 14px 0 20px 0;
+}
+.bento-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 14px 18px;
+}
+.bento-label {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #64748B;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+}
+.bento-value {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-size: 24px;
+    font-weight: 800;
+    color: #0F172A;
+}
+.prospect-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 14px;
+    padding: 18px 22px;
+    margin-bottom: 14px;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
+}
+.card-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
+.rank-pill {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    background: #F1F5F9;
+    color: #334155;
+    padding: 3px 8px;
+    border-radius: 6px;
+    margin-right: 6px;
+}
+.company-name {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: #0F172A;
+}
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-left: 6px;
+}
+.tier-P1 { background: #ECFDF5; color: #047857; border: 1px solid #A7F3D0; }
+.tier-P2 { background: #EEF2FF; color: #4338CA; border: 1px solid #C7D2FE; }
+.tier-P3 { background: #FFFBEB; color: #B45309; border: 1px solid #FDE68A; }
+.tier-P4 { background: #F1F5F9; color: #475569; border: 1px solid #E2E8F0; }
+.urg-High { background: #FFF1F2; color: #BE123C; }
+.urg-Medium { background: #FFFBEB; color: #B45309; }
+.urg-Low, .urg-None { background: #F1F5F9; color: #64748B; }
+.ev-Confirmed { background: #ECFDF5; color: #047857; }
+.ev-Observed { background: #EFF6FF; color: #1D4ED8; }
+.ev-Inferred { background: #F8FAFC; color: #475569; border: 1px solid #E2E8F0; }
+.score-num {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-size: 20px;
+    font-weight: 800;
+    color: #4F46E5;
+    text-align: right;
+}
+.metrics-strip {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    background: #F8FAFC;
+    border: 1px solid #F1F5F9;
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+}
+.m-item span {
+    display: block;
+    font-size: 11px;
+    color: #64748B;
+}
+.m-item strong {
+    font-size: 13px;
+    color: #0F172A;
+    font-weight: 600;
+}
+.signal-callout {
+    background: #FAFAFF;
+    border-left: 3px solid #4F46E5;
+    padding: 9px 12px;
+    border-radius: 0 8px 8px 0;
+    font-size: 13px;
+    color: #334155;
+    margin-bottom: 12px;
+}
+.dm-header {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #64748B;
+    margin-bottom: 6px;
+}
+.dm-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.dm-chip {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 10px;
+    padding: 8px 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+.dm-persona {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: #4338CA;
+    background: #EEF2FF;
+    padding: 2px 6px;
+    border-radius: 4px;
+    display: inline-block;
+    margin-bottom: 2px;
+}
+.dm-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: #0F172A;
+}
+.dm-role {
+    font-size: 11.5px;
+    color: #475569;
+}
+.dm-mail {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: #047857;
+    margin-top: 2px;
+}
+.li-btn {
+    font-size: 11px;
+    font-weight: 600;
+    color: #0A66C2 !important;
+    background: #EFF6FF;
+    border: 1px solid #BFDBFE;
+    padding: 4px 8px;
+    border-radius: 6px;
+    text-decoration: none !important;
+    white-space: nowrap;
+}
+.card-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding-top: 10px;
+    border-top: 1px solid #F1F5F9;
+    font-size: 12.5px;
+    color: #475569;
+}
+.action-link {
+    padding: 4px 10px;
+    border-radius: 6px;
+    background: #EEF2FF;
+    color: #4F46E5 !important;
+    font-weight: 600;
+    font-size: 12px;
+    text-decoration: none !important;
+}
+div.stButton > button[kind="primary"] {
+    background: #4F46E5 !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+}
+</style>
+""")
 
 LINK_COLUMNS = {
     "Website": st.column_config.LinkColumn("Website"),
     "Source": st.column_config.LinkColumn("Source"),
     "Employee source": st.column_config.LinkColumn("Employee source"),
-    "Stage 3 source": st.column_config.LinkColumn("Stage 3 source"),
     "LinkedIn": st.column_config.LinkColumn("LinkedIn"),
     "Employees": st.column_config.NumberColumn("Employees", format="%d"),
     "Est. frontline (estimate)": st.column_config.NumberColumn("Est. frontline (estimate)", format="%d"),
@@ -1857,111 +1685,62 @@ LINK_COLUMNS = {
 }
 S = st.session_state
 
-# Hero Header
-st.markdown("""
+render_html("""
 <div class="saas-hero">
-    <div class="saas-hero-badge">Hunar.AI &bull; GTM Intelligence Engine</div>
-    <h1>Hunar Select Prospecting &amp; Hiring Radar</h1>
-    <p>Select a target sector and workforce scale to dynamically discover high-intent Indian enterprises, verify frontline headcount, capture live hiring triggers, and map multi-level Talent Acquisition, HR &amp; Operations buyers.</p>
+<h1>Hunar Select: Recruitment Intelligence Engine</h1>
+<p>Discover target Indian enterprises, verify frontline workforce scale, detect live hiring signals, and identify LinkedIn decision-makers.</p>
 </div>
-""", unsafe_allow_html=True)
+""")
 
-# Control Bar Card
 with st.container(border=True):
-    col1, col2, col3, col4 = st.columns([2.2, 2.2, 1.4, 2.2])
-    industry = col1.selectbox("Target Industry", INDUSTRIES)
+    col1, col2, col3, col4 = st.columns([2.2, 2.2, 1.3, 2.3])
+    industry = col1.selectbox("Industry", INDUSTRIES)
     size = col2.selectbox("Company Size (Employees)", SIZE_BANDS)
     col3.text_input("Geography", value="India", disabled=True)
     with col4:
         st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        run_clicked = st.button("Launch Live Research", type="primary", use_container_width=True)
+        run_clicked = st.button("Launch Research", type="primary", use_container_width=True)
 
-    if "disc" in S and "score" not in S:
-        resume_clicked = st.button("Resume Unfinished Run", use_container_width=True)
-    else:
-        resume_clicked = False
+    resume_clicked = st.button("Resume Unfinished Run", use_container_width=True) if ("disc" in S and "score" not in S) else False
 
-# Optional Apollo / Hunter Enrichment Drawer
-with st.expander("Optional Contact Enrichment (Apollo.io / Hunter.io API Keys)"):
-    st.caption("Leave blank to run purely on public LinkedIn & web search. Paste an Apollo or Hunter API key anytime to unlock direct work emails and phone numbers—even on pre-loaded snapshots.")
-    ek1, ek2 = st.columns(2)
-    apollo_input = ek1.text_input(
-        "Apollo.io API Key (Optional)",
-        value=S.get("ui_secret_APOLLO_API_KEY", ""),
-        type="password",
-        placeholder="Paste Apollo key to unlock direct emails/phones...",
-    )
-    hunter_input = ek2.text_input(
-        "Hunter.io API Key (Optional)",
-        value=S.get("ui_secret_HUNTER_API_KEY", ""),
-        type="password",
-        placeholder="Paste Hunter key for HR domain search...",
-    )
-    S["ui_secret_APOLLO_API_KEY"] = apollo_input
-    S["ui_secret_HUNTER_API_KEY"] = hunter_input
-
-    if "dm" in S and get_secret("APOLLO_API_KEY"):
-        if st.button("Enrich Current Decision-Makers with Apollo Now"):
-            with st.spinner("Enriching mapped stakeholders via Apollo.io..."):
-                added = enrich_loaded_with_apollo(st.write)
-            st.success(f"Apollo enrichment complete: {added} new verified work emails unlocked and priority scores updated.")
+# Compact saved-run loader (only shown if saved files exist or user wants to load)
+saved = sorted(os.listdir(SAVE_DIR)) if os.path.isdir(SAVE_DIR) else []
+if saved:
+    with st.expander("Load Previous Run"):
+        sc1, sc2 = st.columns([3, 1])
+        pick = sc1.selectbox("Saved runs", saved, label_visibility="collapsed")
+        if sc2.button("Load Run", use_container_width=True):
+            with open(os.path.join(SAVE_DIR, pick)) as f:
+                load_run_data(json.load(f))
             st.rerun()
 
 if run_clicked or resume_clicked:
-    with st.status("Executing 5-Stage Intelligence Pipeline (~10–15 mins for full live discovery)...", expanded=True) as status:
+    with st.status("Running 5-stage research pipeline...", expanded=True) as status:
         try:
             run_all(industry, size, st.write, resume=resume_clicked)
-            status.update(label="Research pipeline complete.", state="complete")
+            status.update(label="Research complete.", state="complete")
             st.rerun()
         except Exception as e:
-            status.update(label="Pipeline paused. Completed stages are checkpointed — click Resume.", state="error")
+            status.update(label="Run paused. Click Resume Unfinished Run to continue.", state="error")
             st.error(str(e))
-
-with st.expander("Workspace Snapshots: Instant Load / Export Runs"):
-    sc1, sc2 = st.columns([2, 2])
-    saved = sorted(os.listdir(SAVE_DIR)) if os.path.isdir(SAVE_DIR) else []
-    with sc1:
-        if saved:
-            pick = st.selectbox("Saved workspace runs", saved)
-            if st.button("Load Snapshot", use_container_width=True):
-                with open(os.path.join(SAVE_DIR, pick)) as f:
-                    load_run_data(json.load(f))
-                st.rerun()
-        else:
-            st.caption("No server snapshots yet. Completed runs save automatically.")
-    with sc2:
-        up = st.file_uploader("Upload run snapshot (.json)", type="json")
-        if up is not None and S.get("_loaded") != (up.name, up.size):
-            load_run_data(json.load(up))
-            S["_loaded"] = (up.name, up.size)
-            st.rerun()
-        if "disc" in S:
-            st.download_button(
-                "Export Current Run (.json)",
-                json.dumps({k: S[k] for k in RUN_KEYS if k in S}, default=str).encode("utf-8"),
-                file_name=f"hunar_{S['disc']['industry'].lower().replace(' ', '_')}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
 
 if "disc" in S:
     d = S["disc"]
     if (d["industry"], d["size"]) != (industry, size):
-        st.info(f"Currently viewing **{d['industry']} ({d['size']} employees)**. Click **Launch Live Research** to run for {industry} ({size}).")
+        st.info(f"Showing **{d['industry']} ({d['size']} employees)**. Click **Launch Research** to run for {industry} ({size}).")
 
     tabs = st.tabs([
-        "Priority Feed & Accounts",
-        "Company Directory",
+        "Ranked Prospects",
+        "Company Profiles",
         "Hiring Signals",
         "Decision-Makers",
-        "Audit & Methodology",
     ])
 
-    # ----- TAB 1: Ranked SaaS Feed -----
+    # ----- TAB 1: Ranked Prospects -----
     with tabs[0]:
         sc = S.get("score")
         if not sc:
-            st.info("Priority rankings appear once all 5 stages complete.")
+            st.info("Ranked prospects will appear once all stages complete.")
         else:
             rows = sc["rows"]
             p1_count = sum(1 for r in rows if r["Tier"] == "P1")
@@ -1969,54 +1748,36 @@ if "disc" in S:
             total_sigs = len(S.get("sig", {}).get("signals", []))
             total_dms = len(S.get("dm", {}).get("people", []))
 
-            st.markdown(f"""
+            render_html(f"""
             <div class="bento-grid">
-                <div class="bento-card">
-                    <div class="bento-label">Qualified Accounts</div>
-                    <div class="bento-value">{len(rows)}</div>
-                    <div class="bento-sub">{p1_count} Priority P1 accounts ready now</div>
-                </div>
-                <div class="bento-card">
-                    <div class="bento-label">Est. Frontline Pool</div>
-                    <div class="bento-value">{total_fl:,}</div>
-                    <div class="bento-sub">Addressable frontline workforce</div>
-                </div>
-                <div class="bento-card">
-                    <div class="bento-label">Verified Hiring Signals</div>
-                    <div class="bento-value">{total_sigs}</div>
-                    <div class="bento-sub">News &amp; web triggers (365d window)</div>
-                </div>
-                <div class="bento-card">
-                    <div class="bento-label">Mapped Decision-Makers</div>
-                    <div class="bento-value">{total_dms}</div>
-                    <div class="bento-sub">TA, CHRO, HR Ops &amp; Ops leaders</div>
-                </div>
+            <div class="bento-card"><div class="bento-label">Target Companies</div><div class="bento-value">{len(rows)}</div></div>
+            <div class="bento-card"><div class="bento-label">Priority P1 Accounts</div><div class="bento-value">{p1_count}</div></div>
+            <div class="bento-card"><div class="bento-label">Est. Frontline Pool</div><div class="bento-value">{total_fl:,}</div></div>
+            <div class="bento-card"><div class="bento-label">LinkedIn Decision-Makers</div><div class="bento-value">{total_dms}</div></div>
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
-            # Filter Toolbar
-            with st.container(border=True):
-                f1, f2, f3, f4 = st.columns([2, 2, 1.8, 1.5])
-                tiers = f1.multiselect("Action Tier", ["P1", "P2", "P3", "P4"], default=["P1", "P2", "P3", "P4"])
-                min_score = f2.slider("Min Priority Score", 0, 100, 0)
-                only_dm = f3.checkbox("Has Decision-Maker")
-                view_mode = f4.radio("Layout", ["SaaS Cards", "Table"], horizontal=True)
+            f1, f2, f3, f4 = st.columns([2.2, 2, 1.8, 1.5])
+            tiers = f1.multiselect("Tier", ["P1", "P2", "P3", "P4"], default=["P1", "P2", "P3", "P4"])
+            min_score = f2.slider("Minimum Score", 0, 100, 0)
+            only_dm = f3.checkbox("Has Decision-Maker")
+            view_mode = f4.radio("View", ["Cards", "Table"], horizontal=True)
 
             shown = [r for r in rows if r["Tier"] in tiers and r["Priority score"] >= min_score
                      and (not only_dm or r["Decision-makers"] > 0)]
 
             col_cap, col_dl = st.columns([4, 1])
-            col_cap.caption(f"Showing **{len(shown)} of {len(rows)}** ranked accounts for **{d['industry']}** ({d['size']})")
+            col_cap.caption(f"Showing **{len(shown)} of {len(rows)}** companies in **{d['industry']}** ({d['size']})")
             if shown:
                 cols = ["Rank", "Company", "Tier", "Priority score", "ICP fit", "Employees", "Est. frontline (estimate)",
                         "Signals (C/O/I)", "Hiring volume (sourced)", "Urgency", "Latest signal", "Top signal",
-                        "Decision-makers", "Best contact", "All decision-makers", "Outreach angle", "Size status"]
+                        "Decision-makers", "All decision-makers", "Outreach angle"]
                 ddf = pd.DataFrame(shown)
                 col_dl.download_button("Export CSV", ddf[cols].to_csv(index=False).encode("utf-8"),
                                        file_name="ranked_companies.csv", mime="text/csv", use_container_width=True)
 
             if not shown:
-                st.warning("No companies match your active filters.")
+                st.warning("No companies match the selected filters.")
             elif view_mode == "Table":
                 st.dataframe(ddf[cols], hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
             else:
@@ -2028,291 +1789,100 @@ if "disc" in S:
                     c_people = [p for p in all_people if p["Company"] == cname]
                     emp_txt = f"{r['Employees']:,}" if r["Employees"] else "Unverified"
                     fl_txt = f"{r['Est. frontline (estimate)']:,}" if r["Est. frontline (estimate)"] else "—"
-                    vol_txt = f"{r['Hiring volume (sourced)']:,} roles" if r["Hiring volume (sourced)"] else "Inferred scale"
+                    vol_txt = f"{r['Hiring volume (sourced)']:,} roles" if r["Hiring volume (sourced)"] else "Inferred"
                     site = er.get("Website", "")
                     site_btn = f'<a class="action-link" href="{esc(site)}" target="_blank">Website &#8599;</a>' if site else ""
 
-                    # Build Multi-Level Decision-Maker Chips HTML
                     if c_people:
                         chips = []
                         for p in c_people:
-                            contact_bits = []
-                            if p.get("Email"):
-                                contact_bits.append(esc(p["Email"]))
-                            if p.get("Phone"):
-                                contact_bits.append(esc(p["Phone"]))
-                            contact_html = (
-                                f'<div class="dm-chip-contact">{" &bull; ".join(contact_bits)}</div>'
-                                if contact_bits else ""
+                            mail_div = f'<div class="dm-mail">{esc(p["Email"])}</div>' if p.get("Email") else ""
+                            li_btn = f'<a class="li-btn" href="{esc(p["LinkedIn"])}" target="_blank">LinkedIn &#8599;</a>' if p.get("LinkedIn") else ""
+                            chips.append(
+                                f'<div class="dm-chip">'
+                                f'<div><span class="dm-persona">{esc(p["Persona"])}</span>'
+                                f'<div class="dm-name">{esc(p["Name"])}</div>'
+                                f'<div class="dm-role">{esc(p["Designation"])}</div>{mail_div}</div>'
+                                f'<div>{li_btn}</div></div>'
                             )
-                            li_link = (
-                                f'<a class="li-mini-btn" href="{esc(p["LinkedIn"])}" target="_blank">LinkedIn &#8599;</a>'
-                                if p.get("LinkedIn") else ""
-                            )
-                            chips.append(f"""
-                            <div class="dm-chip">
-                                <div>
-                                    <div class="dm-persona-tag">{esc(p['Persona'])}</div>
-                                    <div class="dm-chip-name">{esc(p['Name'])}</div>
-                                    <div class="dm-chip-role">{esc(p['Designation'])}</div>
-                                    {contact_html}
-                                </div>
-                                <div>{li_link}</div>
-                            </div>
-                            """)
-                        stakeholder_html = f"""
-                        <div class="stakeholder-section">
-                            <div class="stakeholder-header">Mapped Decision-Makers ({len(c_people)} Stakeholders)</div>
-                            <div class="stakeholder-grid">{''.join(chips)}</div>
-                        </div>
-                        """
+                        dm_block = f'<div class="dm-header">Points of Contact ({len(c_people)})</div><div class="dm-grid">{"".join(chips)}</div>'
                     else:
                         li_search = f"[https://www.linkedin.com/search/results/people/?keywords=](https://www.linkedin.com/search/results/people/?keywords=){quote_plus(cname + ' Talent Acquisition OR HR OR CHRO')}"
-                        stakeholder_html = f"""
-                        <div class="stakeholder-section">
-                            <div class="stakeholder-header">Mapped Decision-Makers</div>
-                            <div class="dm-chip" style="justify-content:space-between;">
-                                <span style="font-size:12px; color:#64748B;">No public LinkedIn profiles indexed in search snippets yet.</span>
-                                <a class="li-mini-btn" href="{esc(li_search)}" target="_blank">Find TA / HR on LinkedIn &#8599;</a>
-                            </div>
-                        </div>
-                        """
+                        dm_block = (
+                            f'<div class="dm-header">Points of Contact</div>'
+                            f'<div class="dm-chip"><span>No public LinkedIn profile matched in search snippets.</span>'
+                            f'<a class="li-btn" href="{esc(li_search)}" target="_blank">Search LinkedIn &#8599;</a></div>'
+                        )
 
-                    st.markdown(f"""
+                    render_html(f"""
                     <div class="prospect-card">
-                        <div class="card-top">
-                            <div>
-                                <span class="rank-pill">#{r['Rank']}</span>
-                                <span class="company-name">{esc(cname)}</span>
-                                <span class="badge tier-{esc(r['Tier'])}">{esc(r['Tier'])}</span>
-                                <span class="badge urg-{esc(r['Urgency'])}">Urgency: {esc(r['Urgency'])}</span>
-                                <span class="badge ev-Inferred">ICP Fit: {r['ICP fit']}/100</span>
-                                <div style="font-size:13px; color:#64748B; margin-top:4px;">
-                                    {esc(er.get('Business profile', ''))} &bull; HQ: <strong>{esc(er.get('HQ', 'India'))}</strong>
-                                </div>
-                            </div>
-                            <div class="score-box">
-                                <div style="font-size:11px; color:#64748B; font-weight:600; text-transform:uppercase;">Priority Score</div>
-                                <div class="score-num">{r['Priority score']} <span style="font-size:13px; color:#94A3B8; font-weight:500;">/ 100</span></div>
-                                <div class="score-bar-bg"><div class="score-bar-fill" style="width:{min(100, int(r['Priority score']))}%;"></div></div>
-                            </div>
-                        </div>
-                        <div class="metrics-strip">
-                            <div class="m-item"><span>Total Workforce</span><strong>{emp_txt}</strong></div>
-                            <div class="m-item"><span>Est. Frontline</span><strong>{fl_txt}</strong></div>
-                            <div class="m-item"><span>Signals (C / O / I)</span><strong>{esc(r['Signals (C/O/I)'])} ({vol_txt})</strong></div>
-                            <div class="m-item"><span>Lead Buyer</span><strong>{esc(r['Best contact'])}</strong></div>
-                        </div>
-                        <div class="signal-callout">
-                            <strong>Latest Trigger ({esc(r['Latest signal'] or 'Recent')}):</strong> {esc(r['Top signal'])}
-                        </div>
-                        {stakeholder_html}
-                        <div class="card-footer">
-                            <div><strong>Recommended Pitch:</strong> {esc(r['Outreach angle'])}</div>
-                            <div>{site_btn}</div>
-                        </div>
+                    <div class="card-top">
+                    <div>
+                    <span class="rank-pill">#{r['Rank']}</span>
+                    <span class="company-name">{esc(cname)}</span>
+                    <span class="badge tier-{esc(r['Tier'])}">{esc(r['Tier'])}</span>
+                    <span class="badge urg-{esc(r['Urgency'])}">Urgency: {esc(r['Urgency'])}</span>
+                    <span class="badge ev-Inferred">ICP Fit: {r['ICP fit']}/100</span>
+                    <div style="font-size:13px; color:#64748B; margin-top:4px;">{esc(er.get('Business profile', ''))} &bull; HQ: <strong>{esc(er.get('HQ', 'India'))}</strong></div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    <div class="score-num">{r['Priority score']} <span style="font-size:12px; color:#64748B; font-weight:500;">/ 100</span></div>
+                    </div>
+                    <div class="metrics-strip">
+                    <div class="m-item"><span>Employees</span><strong>{emp_txt}</strong></div>
+                    <div class="m-item"><span>Est. Frontline</span><strong>{fl_txt}</strong></div>
+                    <div class="m-item"><span>Signals (C / O / I)</span><strong>{esc(r['Signals (C/O/I)'])} ({vol_txt})</strong></div>
+                    <div class="m-item"><span>Operating Footprint</span><strong>{esc(er.get('Operating locations') or er.get('HQ') or 'India')}</strong></div>
+                    </div>
+                    <div class="signal-callout"><strong>Top Hiring Signal ({esc(r['Latest signal'] or 'Recent')}):</strong> {esc(r['Top signal'])}</div>
+                    {dm_block}
+                    <div class="card-footer">
+                    <div><strong>Outreach Angle:</strong> {esc(r['Outreach angle'])}</div>
+                    <div>{site_btn}</div>
+                    </div>
+                    </div>
+                    """)
 
-            # Deep-Dive Inspector Drawer
-            if shown:
-                st.markdown("---")
-                st.subheader("Account Deep-Dive Inspector")
-                choice = st.selectbox("Select an account to inspect score math, signals, and buyers",
-                                      [r["Company"] for r in shown])
-                row = next(r for r in shown if r["Company"] == choice)
-                enr_row = next((r for r in S["enr"]["rows"] if r["Company"] == choice), {})
-
-                with st.container(border=True):
-                    d1, d2 = st.columns([1.2, 1])
-                    with d1:
-                        st.markdown(f"#### {choice} ({row['Tier']} &bull; Score {row['Priority score']})")
-                        st.write(f"**Business Model:** {enr_row.get('Business model') or 'N/A'}")
-                        st.write(f"**Operating Footprint:** {enr_row.get('Operating locations') or 'Not stated'}")
-                        st.write(f"**Target Roles:** {enr_row.get('Frontline roles (inferred)') or 'N/A'}")
-                        st.info(f"**Sales Hook:** {row['Outreach angle']}")
-                        if enr_row.get("Employee source"):
-                            st.markdown(f"[Verify Headcount Source &#8599;]({enr_row['Employee source']})")
-                    with d2:
-                        st.markdown("**Score Attribution Breakdown**")
-                        st.dataframe(pd.DataFrame(sc["breakdowns"][choice])[["Criterion", "Sub-score (0-100)", "Weight", "Contribution"]],
-                                     hide_index=True, use_container_width=True)
-
-                    mine = [s for s in S["sig"]["signals"] if s["Company"] == choice]
-                    if mine:
-                        st.markdown("**Captured Hiring Signals**")
-                        st.dataframe(pd.DataFrame(mine)[["Signal type", "Evidence level", "Date", "Summary", "Est. volume", "How Hunar Select can help", "Source"]],
-                                     hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
-
-                    ppl = [p for p in S["dm"]["people"] if p["Company"] == choice]
-                    if ppl:
-                        st.markdown("**Mapped Decision-Makers**")
-                        st.dataframe(pd.DataFrame(ppl)[["Name", "Designation", "Persona", "LinkedIn", "Email", "Phone", "Contact status", "Relevance"]],
-                                     hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
-
-    # ----- TAB 2: Companies -----
+    # ----- TAB 2: Company Profiles -----
     with tabs[1]:
         enr = S.get("enr")
         if not enr:
-            st.info("Company details appear after Step 2.")
+            st.info("Company profiles appear after Stage 2.")
         else:
             rows = enr["rows"]
-            n_ver = sum(1 for r in rows if r["Size status"] == "Verified")
-            st.caption(f"{len(rows)} target enterprises discovered ({n_ver} headcount-verified within {d['size']}).")
             df = pd.DataFrame(rows)
             df.insert(0, "#", range(1, len(df) + 1))
-            st.dataframe(df, hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
-            st.download_button("Download Company Directory (CSV)", df.to_csv(index=False).encode("utf-8"),
+            show_cols = ["#", "Company", "Business profile", "HQ", "Employees", "Est. frontline (estimate)",
+                         "Operating locations", "Frontline roles (inferred)", "Size status", "Website"]
+            st.dataframe(df[show_cols], hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
+            st.download_button("Download Company Profiles (CSV)", df[show_cols].to_csv(index=False).encode("utf-8"),
                                file_name="companies.csv", mime="text/csv")
 
     # ----- TAB 3: Hiring Signals -----
     with tabs[2]:
         sig = S.get("sig")
         if not sig:
-            st.info("Hiring signals appear after Step 3.")
+            st.info("Hiring signals appear after Stage 3.")
         else:
-            sc1, sc2 = st.columns([2, 1])
-            levels = sc1.multiselect("Filter by Evidence Level", list(EVIDENCE_POINTS), default=list(EVIDENCE_POINTS), key="level_filter")
-            sig_view = sc2.radio("Signal View", ["Signal Cards", "Table"], horizontal=True)
+            levels = st.multiselect("Evidence Level", list(EVIDENCE_POINTS), default=list(EVIDENCE_POINTS), key="level_filter")
             shown_sigs = [x for x in sig["signals"] if x["Evidence level"] in levels]
-
             if shown_sigs:
                 sdf = pd.DataFrame(shown_sigs)
-                st.download_button("Export Hiring Signals (CSV)", sdf.to_csv(index=False).encode("utf-8"),
+                cols = ["Company", "Signal type", "Evidence level", "Date", "Urgency", "Summary", "Roles", "Locations",
+                        "Est. volume", "Why it is an opportunity", "How Hunar Select can help", "Source"]
+                st.dataframe(sdf[cols], hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
+                st.download_button("Download Hiring Signals (CSV)", sdf[cols].to_csv(index=False).encode("utf-8"),
                                    file_name="signals.csv", mime="text/csv")
-                if sig_view == "Table":
-                    first = ["Company", "Signal type", "Evidence level", "Date", "Urgency", "Summary", "Roles", "Locations",
-                             "Est. volume", "Why it is an opportunity", "How Hunar Select can help", "Source"]
-                    st.dataframe(sdf[first], hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
-                else:
-                    for s in shown_sigs[:40]:
-                        st.markdown(f"""
-                        <div class="prospect-card" style="padding:16px 20px;">
-                            <div class="card-top" style="margin-bottom:8px;">
-                                <div>
-                                    <span class="company-name" style="font-size:16px;">{esc(s['Company'])}</span>
-                                    <span class="badge ev-{esc(s['Evidence level'])}">{esc(s['Evidence level'])}</span>
-                                    <span class="badge urg-{esc(s['Urgency'])}">{esc(s['Signal type'])}</span>
-                                </div>
-                                <div style="font-size:12px; color:#64748B;">
-                                    {esc(s['Date'])} &bull; <strong>{esc(s['Source name'])}</strong>
-                                </div>
-                            </div>
-                            <div style="font-size:14px; font-weight:600; color:#0F172A; margin-bottom:6px;">{esc(s['Summary'])}</div>
-                            <div style="font-size:13px; color:#475569; margin-bottom:8px;">
-                                <strong>Hunar Select Angle:</strong> {esc(s['How Hunar Select can help'])}
-                            </div>
-                            <div class="card-footer" style="padding-top:8px;">
-                                <span><strong>Roles:</strong> {esc(s['Roles'] or 'Frontline staff')} &bull; <strong>Locations:</strong> {esc(s['Locations'] or 'Pan-India')} &bull; <strong>Est. Volume:</strong> {esc(s['Est. volume'])}</span>
-                                <a class="action-link" href="{esc(s['Source'])}" target="_blank">Read Source &#8599;</a>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
 
     # ----- TAB 4: Decision-Makers -----
     with tabs[3]:
         dm = S.get("dm")
         if not dm:
-            st.info("Decision-makers appear after Step 4.")
+            st.info("Decision-makers appear after Stage 4.")
         else:
-            n_with = len({p["Company"] for p in dm["people"]})
-            n_mail = sum(1 for p in dm["people"] if p["Email"])
-            st.caption(f"{len(dm['people'])} verified buyer profiles across {n_with} companies ({n_mail} enriched with direct work emails).")
             if dm["people"]:
-                all_personas = sorted({p["Persona"] for p in dm["people"]})
-                pf1, pf2 = st.columns([3, 1])
-                sel_personas = pf1.multiselect("Filter by Buyer Persona", all_personas, default=all_personas, key="dm_persona_filter")
-                filtered_ppl = [p for p in dm["people"] if p["Persona"] in sel_personas]
-
-                pdf = pd.DataFrame(filtered_ppl)[["Company", "Name", "Designation", "Persona", "LinkedIn", "Email", "Phone",
-                                                    "Contact status", "Contact source", "Relevance"]]
-                pf2.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
-                pf2.download_button("Export Buyers (CSV)", pdf.to_csv(index=False).encode("utf-8"),
-                                    file_name="decision_makers.csv", mime="text/csv", use_container_width=True)
-
-                cols_dm = st.columns(2)
-                for idx, p in enumerate(filtered_ppl):
-                    with cols_dm[idx % 2]:
-                        contact_tags = []
-                        if p.get("Email"):
-                            contact_tags.append(f'<span class="badge ev-Confirmed">{esc(p["Email"])}</span>')
-                        if p.get("Phone"):
-                            contact_tags.append(f'<span class="badge ev-Confirmed">{esc(p["Phone"])}</span>')
-                        if not contact_tags:
-                            contact_tags.append('<span class="badge ev-Inferred">LinkedIn Outreach</span>')
-                        li_btn = f'<a class="action-link" href="{esc(p["LinkedIn"])}" target="_blank">LinkedIn Profile &#8599;</a>' if p["LinkedIn"] else ""
-                        st.markdown(f"""
-                        <div class="prospect-card" style="padding:16px 18px;">
-                            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
-                                <div>
-                                    <div style="font-size:11.5px; font-weight:700; color:#4F46E5; text-transform:uppercase;">{esc(p['Company'])}</div>
-                                    <div style="font-family:'Plus Jakarta Sans',sans-serif; font-size:16px; font-weight:700; color:#0F172A;">{esc(p['Name'])}</div>
-                                    <div style="font-size:13px; color:#475569;">{esc(p['Designation'])}</div>
-                                </div>
-                                <div style="text-align:right;">{''.join(contact_tags)}</div>
-                            </div>
-                            <div style="font-size:12.5px; color:#64748B; margin:10px 0;">{esc(p['Relevance'])}</div>
-                            <div class="card-footer" style="padding-top:8px;">
-                                <span style="font-size:11.5px; font-weight:600; color:#4338CA;">{esc(p['Persona'])}</span>
-                                {li_btn}
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-            st.markdown("---")
-            st.markdown("**Public Company-Level Recruitment Contacts**")
-            crow = [{"Company": k, "Emails": " | ".join(e["value"] for e in v["emails"]),
-                     "Phones": " | ".join(p["value"] for p in v["phones"]),
-                     "Sources": " | ".join(x["source"] for x in (v["emails"] + v["phones"]))[:300]}
-                    for k, v in dm["company_contacts"].items() if v["emails"] or v["phones"]]
-            if crow:
-                st.dataframe(pd.DataFrame(crow), hide_index=True, use_container_width=True)
+                pdf = pd.DataFrame(dm["people"])[["Company", "Name", "Designation", "Persona", "LinkedIn", "Email", "Phone", "Relevance"]]
+                st.dataframe(pdf, hide_index=True, column_config=LINK_COLUMNS, use_container_width=True)
+                st.download_button("Download Decision-Makers (CSV)", pdf.to_csv(index=False).encode("utf-8"),
+                                   file_name="decision_makers.csv", mime="text/csv")
             else:
-                st.caption("No public company-level recruitment emails/phones indexed for this batch.")
-
-    # ----- TAB 5: Sources & Audit -----
-    with tabs[4]:
-        st.markdown("**Deterministic Scoring Formula:** Priority Score = Hiring Intensity (20%) + Open Volume (15%) + Frontline Workforce (15%) + Urgency (15%) + Outsourcing Potential (15%) + Geographic Expansion (10%) + Decision-Maker Accessibility (10%).")
-        enr, sig, dm = S.get("enr"), S.get("sig"), S.get("dm")
-        with st.expander("Stage 1: Discovery Queries & Raw Search Links"):
-            st.write("Queries executed: " + " | ".join(d["queries"]))
-            st.dataframe(pd.DataFrame(d["results"])[["title", "link", "query"]], hide_index=True,
-                         column_config={"link": st.column_config.LinkColumn("link")}, use_container_width=True)
-        if enr:
-            with st.expander("Stage 2: Headcount Verification Logs"):
-                ev = [{"Company": k, "Search": v["query"], "Links": "  ".join(v["links"][:4])} for k, v in enr["evidence"].items()]
-                st.dataframe(pd.DataFrame(ev), hide_index=True, use_container_width=True)
-        if sig:
-            with st.expander("Stage 3: Raw Signal Headlines & Guardrail Diagnostics"):
-                st.json(sig["diagnostics"])
-                for name, ev in sig["evidence"].items():
-                    st.markdown(f"**{name}**")
-                    st.text("\n".join(ev["lines"]) if ev["lines"] else "No evidence found.")
-        if dm:
-            with st.expander("Stage 4: Decision-Maker Search Audit & Diagnostics"):
-                st.json(dm["diagnostics"])
-
-# ---------------- API Health Check ----------------
-with st.expander("System Diagnostics & API Health Check"):
-    def test_gemini():
-        text, model = gemini_generate("Reply with the single word OK")
-        return True, f"Connected ({model})"
-
-    def test_serper():
-        res = serper_search("quick commerce companies India", 3)
-        return True, f"Connected ({len(res)} live results)"
-
-    def test_news():
-        url = "[https://news.google.com/rss/search?q=quick+commerce+hiring&hl=en-IN&gl=IN&ceid=IN:en](https://news.google.com/rss/search?q=quick+commerce+hiring&hl=en-IN&gl=IN&ceid=IN:en)"
-        r = requests.get(url, timeout=30)
-        return (r.status_code == 200), f"Connected ({r.text.count('<item>')} RSS items)"
-
-    if st.button("Verify Live API Connections"):
-        for label, fn in [("Gemini LLM", test_gemini), ("Serper Search", test_serper), ("Google News RSS", test_news)]:
-            try:
-                ok, msg = fn()
-                st.success(f"{label}: {msg}") if ok else st.error(f"{label}: {msg}")
-            except Exception as e:
-                st.error(f"{label}: {e}")
-
-# --- end of app.py ---
+                st.info("No LinkedIn decision-makers were extracted for this run.")
